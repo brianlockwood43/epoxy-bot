@@ -105,6 +105,42 @@ def build_context_pack() -> str:
     lines = "\n".join(f"- {m}" for m in SEED_MEMORIES)
     return f"Context pack (seed memories):\n{lines}"
 
+DISCORD_MAX_MESSAGE_LEN = 1900  # keep under 2000 hard limit
+
+def chunk_text(text: str, limit: int = DISCORD_MAX_MESSAGE_LEN) -> list[str]:
+    text = text or ""
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    remaining = text
+
+    while len(remaining) > limit:
+        # Prefer splitting on paragraph, then newline, then space
+        split_at = remaining.rfind("\n\n", 0, limit)
+        if split_at == -1:
+            split_at = remaining.rfind("\n", 0, limit)
+        if split_at == -1:
+            split_at = remaining.rfind(" ", 0, limit)
+        if split_at == -1:
+            split_at = limit
+
+        chunk = remaining[:split_at].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        remaining = remaining[split_at:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+
+    return chunks
+
+
+async def send_chunked(channel: discord.abc.Messageable, text: str) -> None:
+    for part in chunk_text(text, DISCORD_MAX_MESSAGE_LEN):
+        await channel.send(part)
+
 # =========================
 # SQLITE
 # =========================
@@ -429,7 +465,8 @@ async def on_message(message: discord.Message):
             )
 
             reply = resp.choices[0].message.content or "(no output)"
-            await message.channel.send(reply)
+            print(f"[REPLY] chars={len(reply)} parts={len(chunk_text(reply))}")
+            await send_chunked(message.channel, reply)
         except Exception as e:
             print(f"[OpenAI] Error: {e}")
             await message.channel.send("Epoxy hiccuped. Check logs 🧴⚙️")
