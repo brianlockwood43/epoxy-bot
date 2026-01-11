@@ -195,6 +195,79 @@ def _set_backfill_done_sync(conn: sqlite3.Connection, channel_id: int, iso_utc: 
         (channel_id, iso_utc)
     )
     conn.commit()
+def _fetch_recent_context_sync(
+    conn: sqlite3.Connection,
+    channel_id: int,
+    before_message_id: int,
+    limit: int
+) -> list[tuple[str, str, str]]:
+    """
+    Returns list of (created_at_utc, author_name, content), newest-first.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT created_at_utc, author_name, content
+        FROM messages
+        WHERE channel_id = ?
+          AND message_id < ?
+          AND content IS NOT NULL
+          AND TRIM(content) != ''
+        ORDER BY message_id DESC
+        LIMIT ?
+        """,
+        (channel_id, before_message_id, limit)
+    )
+    return cur.fetchall()
+
+
+def _format_recent_context(rows: list[tuple[str, str, str]], max_chars: int, max_line_chars: int) -> str:
+    """
+    rows expected newest-first; formats oldest->newest, truncating to max_chars.
+    """
+    if not rows:
+        return "(no recent context found)"
+
+    # Reverse to chronological
+    rows = list(reversed(rows))
+
+    lines: list[str] = []
+    total = 0
+
+    for created_at_utc, author_name, content in rows:
+        clean = " ".join((content or "").split())  # collapse whitespace/newlines
+        if len(clean) > max_line_chars:
+            clean = clean[: max_line_chars - 1] + "…"
+
+        # Keep timestamp compact (ISO -> just time if present)
+        ts = created_at_utc
+        if "T" in created_at_utc:
+            # e.g. 2026-01-11T04:24:09.123456 -> 04:24
+            try:
+                ts = created_at_utc.split("T", 1)[1][:5]
+            except Exception:
+                ts = created_at_utc
+
+        line = f"[{ts}] {author_name}: {clean}"
+
+        if total + len(line) + 1 > max_chars:
+            break
+
+        lines.append(line)
+        total += len(line) + 1
+
+    return "\n".join(lines) if lines else "(context truncated to 0 lines)"
+
+async def get_recent_channel_context(channel_id: int, before_message_id: int) -> str:
+    async with db_lock:
+        rows = await asyncio.to_thread(
+            _fetch_recent_context_sync,
+            db_conn,
+            channel_id,
+            before_message_id,
+            RECENT_CONTEXT_LIMIT
+        )
+    return _format_recent_context(rows, RECENT_CONTEXT_MAX_CHARS, MAX_LINE_CHARS)
 
 async def log_message(message: discord.Message) -> None:
     attachments = ""
@@ -240,6 +313,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 BACKFILL_LIMIT = int(os.getenv("EPOXY_BACKFILL_LIMIT", "2000"))  # per channel, first boot
 BACKFILL_PAUSE_EVERY = 200
 BACKFILL_PAUSE_SECONDS = 0.25
+RECENT_CONTEXT_LIMIT = int(os.getenv("EPOXY_RECENT_CONTEXT_LIMIT", "40"))
+RECENT_CONTEXT_MAX_CHARS = int(os.getenv("EPOXY_RECENT_CONTEXT_CHARS", "6000"))
+MAX_LINE_CHARS = int(os.getenv("EPOXY_RECENT_CONTEXT_LINE_CHARS", "300"))
 
 async def backfill_channel(channel: discord.abc.Messageable) -> None:
     if not hasattr(channel, "id"):
@@ -307,11 +383,14 @@ async def on_message(message: discord.Message):
             return
 
         try:
+            recent_context = await get_recent_channel_context(message.channel.id, message.id)
+
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT_BASE},
                     {"role": "system", "content": build_context_pack()},
+                    {"role": "system", "content": f"Recent channel context (most recent {RECENT_CONTEXT_LIMIT} msgs, truncated):\n{recent_context}"},
                     {"role": "user", "content": prompt},
                 ],
             )
