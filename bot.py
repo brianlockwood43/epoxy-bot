@@ -384,22 +384,50 @@ async def on_message(message: discord.Message):
             return
 
         try:
+            MAX_MSG_CONTENT = 1900  # keep safely under the 2000-char hard limit
+
             recent_context, ctx_rows = await get_recent_channel_context(message.channel.id, message.id)
 
-            # Absolute hard cap (belt + suspenders)
-            recent_context = recent_context[:6000]
+            # Cap each field individually (the API limit applies per `messages[i].content`)
+            context_pack = build_context_pack()
+            if len(context_pack) > MAX_MSG_CONTENT:
+                context_pack = context_pack[:MAX_MSG_CONTENT]
 
-            print(f"[CTX] channel={message.channel.id} rows={ctx_rows} before={message.id} chars={len(recent_context)} limit={RECENT_CONTEXT_LIMIT}")
+            if len(recent_context) > MAX_MSG_CONTENT:
+                recent_context = recent_context[:MAX_MSG_CONTENT]
+
+            # Also cap the user prompt (just in case someone pastes a novel)
+            safe_prompt = prompt[:MAX_MSG_CONTENT] if prompt else ""
+
+            print(
+                f"[CTX] channel={message.channel.id} rows={ctx_rows} before={message.id} "
+                f"ctx_chars={len(recent_context)} pack_chars={len(context_pack)} prompt_chars={len(safe_prompt)} "
+                f"limit={RECENT_CONTEXT_LIMIT}"
+            )
 
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
+                # If you want less bubbly: uncomment temperature line and set low
+                # temperature=0.2,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_BASE},
-                    {"role": "system", "content": build_context_pack()},
-                    {"role": "system", "content": f"Recent channel context (most recent {RECENT_CONTEXT_LIMIT} msgs, truncated):\n{recent_context}"},
-                    {"role": "user", "content": prompt},
+                    {"role": "system", "content": SYSTEM_PROMPT_BASE[:MAX_MSG_CONTENT]},
+                    {"role": "system", "content": context_pack},
+                    {
+                        "role": "system",
+                        "content": (
+                            "Use ONLY the 'Recent channel context' provided below. "
+                            "Do not rely on general knowledge. "
+                            "If the context is insufficient, say so and ask 1 clarifying question."
+                        )[:MAX_MSG_CONTENT],
+                    },
+                    {
+                        "role": "system",
+                        "content": f"Recent channel context:\n{recent_context}"[:MAX_MSG_CONTENT],
+                    },
+                    {"role": "user", "content": safe_prompt},
                 ],
             )
+
             reply = resp.choices[0].message.content or "(no output)"
             await message.channel.send(reply)
         except Exception as e:
