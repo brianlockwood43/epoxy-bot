@@ -16,7 +16,7 @@ if not DISCORD_TOKEN:
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY env var")
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 
 # Railway persistent path (set this to your mounted volume path)
 DB_PATH = os.getenv("EPOXY_DB_PATH", "epoxy_memory.db")
@@ -258,7 +258,7 @@ def _format_recent_context(rows: list[tuple[str, str, str]], max_chars: int, max
 
     return "\n".join(lines) if lines else "(context truncated to 0 lines)"
 
-async def get_recent_channel_context(channel_id: int, before_message_id: int) -> str:
+async def get_recent_channel_context(channel_id: int, before_message_id: int) -> tuple[str, int]:
     async with db_lock:
         rows = await asyncio.to_thread(
             _fetch_recent_context_sync,
@@ -267,7 +267,8 @@ async def get_recent_channel_context(channel_id: int, before_message_id: int) ->
             before_message_id,
             RECENT_CONTEXT_LIMIT
         )
-    return _format_recent_context(rows, RECENT_CONTEXT_MAX_CHARS, MAX_LINE_CHARS)
+    text = _format_recent_context(rows, RECENT_CONTEXT_MAX_CHARS, MAX_LINE_CHARS)
+    return text, len(rows)
 
 async def log_message(message: discord.Message) -> None:
     attachments = ""
@@ -383,7 +384,12 @@ async def on_message(message: discord.Message):
             return
 
         try:
-            recent_context = await get_recent_channel_context(message.channel.id, message.id)
+            recent_context, ctx_rows = await get_recent_channel_context(message.channel.id, message.id)
+
+            # Absolute hard cap (belt + suspenders)
+            recent_context = recent_context[:6000]
+
+            print(f"[CTX] channel={message.channel.id} rows={ctx_rows} before={message.id} chars={len(recent_context)} limit={RECENT_CONTEXT_LIMIT}")
 
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
