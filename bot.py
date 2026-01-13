@@ -40,24 +40,63 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 # - “Wire to M3” means: the DB schema + codepaths exist up through M3,
 #   but you can keep runtime behavior at M0/M1/M2 with the stage flags.
 #
-MEMORY_STAGE = os.getenv("EPOXY_MEMORY_STAGE", "M1").strip().upper()
-STAGE_RANK = {"M0": 0, "M1": 1, "M2": 2, "M3": 3}
-MEMORY_STAGE_RANK = STAGE_RANK.get(MEMORY_STAGE, 0)
+# ---- Memory / staging config (drop-in) ----
+import os
+import re
 
+# Stage gating (default conservative; set env to enable higher stages)
+MEMORY_STAGE = os.getenv("EPOXY_MEMORY_STAGE", "M0").strip().upper()
+STAGE_RANK = {"M0": 0, "M1": 1, "M2": 2, "M3": 3}
+MEMORY_STAGE_RANK = STAGE_RANK.get(MEMORY_STAGE, 3)
+
+def stage_at_least(stage: str) -> bool:
+    return MEMORY_STAGE_RANK >= STAGE_RANK.get(stage.strip().upper(), 0)
+
+# Feature toggles (default OFF; flip via env when testing)
 AUTO_CAPTURE = os.getenv("EPOXY_MEMORY_ENABLE_AUTO_CAPTURE", "0").strip() == "1"
 AUTO_SUMMARY = os.getenv("EPOXY_MEMORY_ENABLE_AUTO_SUMMARY", "0").strip() == "1"
 
 # Topic suggestion (late-M3 ergonomics)
-# If enabled, Epoxy can suggest a topic_id for memories that lack an explicit topic.
-# This is intentionally conservative: it only suggests from an allowlist (or known topics if no allowlist).
 TOPIC_SUGGEST = os.getenv("EPOXY_TOPIC_SUGGEST", "0").strip() == "1"
-TOPIC_MIN_CONF = float(os.getenv("EPOXY_TOPIC_MIN_CONF", "0.85"))
-_TOPIC_ALLOWLIST_RAW = os.getenv("EPOXY_TOPIC_ALLOWLIST", "ops,announcements,community,coaches,workshops,one_on_one,member_support,conflict_resolution,marketing,content,website,pricing,billing,roadmap,infra,bugs,deployments,epoxy_bot,experiments,baby_brain,console_bay,coaching_method,layer_model,telemetry,track_guides").strip()
-TOPIC_ALLOWLIST = [t.strip().lower() for t in re.split(r"[;,]+", _TOPIC_ALLOWLIST_RAW) if t.strip()] if _TOPIC_ALLOWLIST_RAW else []
+try:
+    TOPIC_MIN_CONF = float(os.getenv("EPOXY_TOPIC_MIN_CONF", "0.85").strip())
+except ValueError:
+    TOPIC_MIN_CONF = 0.85
+
 RESERVED_KIND_TAGS = {"decision", "policy", "canon"}
 
-def stage_at_least(stage: str) -> bool:
-    return MEMORY_STAGE_RANK >= STAGE_RANK.get(stage.upper(), 0)
+_DEFAULT_TOPIC_ALLOWLIST = (
+    "ops,announcements,community,coaches,workshops,league,one_on_one,"
+    "member_support,conflict_resolution,marketing,content,website,pricing,billing,"
+    "policies,canon,roadmap,infra,bugs,deployments,epoxy_bot,experiments,baby_brain,"
+    "console_bay,coaching_method,layer_model,telemetry,track_guides"
+)
+
+# Allowlist behavior:
+# - If env var is unset: use default allowlist above.
+# - If env var is set to empty/whitespace: treat as "no explicit allowlist" (fallback to known DB topics).
+# - Otherwise: parse env var.
+_raw = os.getenv("EPOXY_TOPIC_ALLOWLIST")
+if _raw is None:
+    _TOPIC_ALLOWLIST_RAW = _DEFAULT_TOPIC_ALLOWLIST
+else:
+    _TOPIC_ALLOWLIST_RAW = _raw.strip()
+
+if not _TOPIC_ALLOWLIST_RAW:
+    TOPIC_ALLOWLIST: list[str] = []
+else:
+    TOPIC_ALLOWLIST = sorted({
+        t.strip().lower()
+        for t in re.split(r"[,\s;]+", _TOPIC_ALLOWLIST_RAW)
+        if t.strip()
+    } - RESERVED_KIND_TAGS)
+
+print(
+    f"[CFG] stage={MEMORY_STAGE} auto_capture={AUTO_CAPTURE} auto_summary={AUTO_SUMMARY} "
+    f"topic_suggest={TOPIC_SUGGEST} topic_min_conf={TOPIC_MIN_CONF} "
+    f"allowlist={'(db-topics)' if not TOPIC_ALLOWLIST else str(len(TOPIC_ALLOWLIST))+' topics'}"
+)
+# ---- end config ----
 
 
 # Railway persistent path (set this to your mounted volume path)
