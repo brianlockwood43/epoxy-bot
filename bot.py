@@ -1350,7 +1350,7 @@ async def remember_cmd(ctx: commands.Context, *, arg: str = ""):
 
     # Key=val format
     if "tags=" in raw or "importance=" in raw or "text=" in raw:
-        m_tags = re.search(r"tags=([^\\s]+)", raw)
+        m_tags = re.search(r"tags=([^\s]+)", raw)
         m_imp = re.search(r"importance=([01])", raw)
         m_text = re.search(r"text=(.+)$", raw)
         if m_tags:
@@ -1361,7 +1361,7 @@ async def remember_cmd(ctx: commands.Context, *, arg: str = ""):
             text = m_text.group(1).strip()
     elif "|" in raw:
         left, right = raw.split("|", 1)
-        tags = re.split(r"[,\\s]+", left.strip())
+        tags = re.split(r"[,\s]+", left.strip())
         text = right.strip()
 
     tags = normalize_tags(tags)
