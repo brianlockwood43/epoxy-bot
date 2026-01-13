@@ -51,8 +51,8 @@ AUTO_SUMMARY = os.getenv("EPOXY_MEMORY_ENABLE_AUTO_SUMMARY", "0").strip() == "1"
 # If enabled, Epoxy can suggest a topic_id for memories that lack an explicit topic.
 # This is intentionally conservative: it only suggests from an allowlist (or known topics if no allowlist).
 TOPIC_SUGGEST = os.getenv("EPOXY_TOPIC_SUGGEST", "0").strip() == "1"
-TOPIC_MIN_CONF = float(os.getenv("EPOXY_TOPIC_MIN_CONF", "0.75"))
-_TOPIC_ALLOWLIST_RAW = os.getenv("EPOXY_TOPIC_ALLOWLIST", "").strip()
+TOPIC_MIN_CONF = float(os.getenv("EPOXY_TOPIC_MIN_CONF", "0.85"))
+_TOPIC_ALLOWLIST_RAW = os.getenv("EPOXY_TOPIC_ALLOWLIST", "ops,announcements,community,coaches,workshops,one_on_one,member_support,conflict_resolution,marketing,content,website,pricing,billing,roadmap,infra,bugs,deployments,epoxy_bot,experiments,baby_brain,console_bay,coaching_method,layer_model,telemetry,track_guides").strip()
 TOPIC_ALLOWLIST = [t.strip().lower() for t in re.split(r"[;,]+", _TOPIC_ALLOWLIST_RAW) if t.strip()] if _TOPIC_ALLOWLIST_RAW else []
 RESERVED_KIND_TAGS = {"decision", "policy", "canon"}
 
@@ -1450,9 +1450,11 @@ async def backfill_channel(channel: discord.abc.Messageable) -> None:
 
     channel_id = channel.id
     if channel_id not in ALLOWED_CHANNEL_IDS:
+        print(f"[Backfill] Skip channel {channel_id}: not in ALLOWED_CHANNEL_IDS")
         return
 
     if await is_backfill_done(channel_id):
+        print(f"[Backfill] Skip channel {channel_id}: already marked done")
         return
 
     print(f"[Backfill] Starting channel {channel_id} ({getattr(channel, 'name', 'unknown')}) limit={BACKFILL_LIMIT}")
@@ -1461,9 +1463,12 @@ async def backfill_channel(channel: discord.abc.Messageable) -> None:
     try:
         # oldest_first=True so inserts happen chronologically
         async for msg in channel.history(limit=BACKFILL_LIMIT, oldest_first=True):
-            if msg.author.bot:
+            # Skip OTHER bots, but keep Epoxy's own messages for context coherence
+            if msg.author.bot and bot.user and msg.author.id != bot.user.id:
                 continue
             await log_message(msg)
+            # OPTIONAL: if you want historical auto-capture into memory_events
+            await maybe_auto_capture(msg)
             count += 1
             if count % BACKFILL_PAUSE_EVERY == 0:
                 await asyncio.sleep(BACKFILL_PAUSE_SECONDS)
@@ -1472,6 +1477,7 @@ async def backfill_channel(channel: discord.abc.Messageable) -> None:
         return
 
     await mark_backfill_done(channel_id)
+    print(f"[Backfill] Done channel {channel_id}. Logged {count} messages.")
 async def maybe_auto_capture(message: discord.Message) -> None:
     """Optional heuristics to store high-signal items without manual commands."""
     if not (AUTO_CAPTURE and stage_at_least("M1")):
@@ -1523,16 +1529,17 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
+    # If it's a bot message, log Epoxy's own messages for context, then stop.
     if message.author.bot:
+        if bot.user and message.author.id == bot.user.id:
+            if message.channel.id in ALLOWED_CHANNEL_IDS:
+                await log_message(message)
         return
 
     if message.channel.id not in ALLOWED_CHANNEL_IDS:
         return
 
-    # Always log in allowed channels
     await log_message(message)
-
-    # Optional auto-capture of high-signal items into persistent memory
     await maybe_auto_capture(message)
 
     # Only respond if mentioned
