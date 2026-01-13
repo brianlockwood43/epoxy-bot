@@ -1666,11 +1666,14 @@ async def backfill_channel(channel: discord.abc.Messageable) -> None:
             await log_message(msg)
 
             if BOOTSTRAP_BACKFILL_CAPTURE and stage_at_least("M1"):
-                # auto-capture only captures decision/policy/canon/#mem patterns by default
-                await maybe_auto_capture(msg)
-                # maybe_auto_capture doesn't return a boolean; if you want counts,
-                # you can add a return value later. For now just track messages processed.
-                captured += 1
+                try:
+                    # auto-capture only captures decision/policy/canon/#mem patterns by default
+                    await maybe_auto_capture(msg)
+                    # maybe_auto_capture doesn't return a boolean; if you want counts,
+                    # you can add a return value later. For now just track messages processed.
+                    captured += 1
+                except Exception as e:
+                    print(f"[AutoCapture] Error: {e}")
 
             count += 1
             if count % BACKFILL_PAUSE_EVERY == 0:
@@ -1709,7 +1712,7 @@ async def maybe_auto_capture(message: discord.Message) -> None:
         await remember_event(text=text, tags=[topic], importance=1, message=message, topic_hint=topic)
         return
 
-    print(f"[Backfill] Done channel {channel_id}. Logged {count} messages.")
+
 
 @bot.event
 async def on_ready():
