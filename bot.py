@@ -1542,6 +1542,10 @@ async def on_message(message: discord.Message):
     await log_message(message)
     await maybe_auto_capture(message)
 
+    # If it's a command, don't also do the mention/LLM response path.
+    if (message.content or "").lstrip().startswith("!"):
+        await bot.process_commands(message)
+        return
     # Only respond if mentioned
     if bot.user and bot.user in message.mentions:
         prompt = message.content.replace(f"<@{bot.user.id}>", "").strip()
