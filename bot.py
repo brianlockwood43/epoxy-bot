@@ -826,11 +826,17 @@ def _get_topic_summary_sync(conn: sqlite3.Connection, topic_id: str) -> dict | N
 
 
 
-def _get_backfill_done_sync(conn: sqlite3.Connection, channel_id: int) -> bool:
+def _get_backfill_done_sync(conn: sqlite3.Connection, channel_id: int) -> tuple[bool, str | None]:
     cur = conn.cursor()
-    cur.execute("SELECT backfill_done FROM channel_state WHERE channel_id = ?", (channel_id,))
+    cur.execute(
+        "SELECT backfill_done, last_backfill_at_utc FROM channel_state WHERE channel_id = ? LIMIT 1",
+        (int(channel_id),),
+    )
     row = cur.fetchone()
-    return bool(row and row[0] == 1)
+    if not row:
+        return (False, None)
+    return (int(row[0]) == 1, row[1])
+
 
 def _set_backfill_done_sync(conn: sqlite3.Connection, channel_id: int, iso_utc: str) -> None:
     cur = conn.cursor()
@@ -846,18 +852,24 @@ def _set_backfill_done_sync(conn: sqlite3.Connection, channel_id: int, iso_utc: 
     )
     conn.commit()
 
-def _reset_backfill_done_sync(conn, channel_id: int) -> None:
+def _reset_backfill_done_sync(conn: sqlite3.Connection, channel_id: int) -> None:
     cur = conn.cursor()
-    # Match whatever you used in _set_backfill_done_sync: usually key='backfill_done'
+    # If a row exists, flip the flag off and clear timestamp.
     cur.execute(
-        "DELETE FROM channel_state WHERE channel_id = ? AND key = ?",
-        (int(channel_id), "backfill_done"),
+        """
+        UPDATE channel_state
+        SET backfill_done = 0,
+            last_backfill_at_utc = NULL
+        WHERE channel_id = ?
+        """,
+        (int(channel_id),),
     )
     conn.commit()
 
 async def reset_backfill_done(channel_id: int) -> None:
     async with db_lock:
         await asyncio.to_thread(_reset_backfill_done_sync, db_conn, int(channel_id))
+
 
 def _fetch_recent_context_sync(
     conn: sqlite3.Connection,
