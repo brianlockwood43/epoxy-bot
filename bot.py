@@ -55,6 +55,9 @@ def stage_at_least(stage: str) -> bool:
 # Feature toggles (default OFF; flip via env when testing)
 AUTO_CAPTURE = os.getenv("EPOXY_MEMORY_ENABLE_AUTO_CAPTURE", "0").strip() == "1"
 AUTO_SUMMARY = os.getenv("EPOXY_MEMORY_ENABLE_AUTO_SUMMARY", "0").strip() == "1"
+BOOTSTRAP_BACKFILL_CAPTURE = os.getenv("EPOXY_BOOTSTRAP_BACKFILL_CAPTURE", "0").strip() == "1"
+BOOTSTRAP_CHANNEL_RESET = os.getenv("EPOXY_BOOTSTRAP_CHANNEL_RESET", "0").strip() == "1"
+
 
 # Topic suggestion (late-M3 ergonomics)
 TOPIC_SUGGEST = os.getenv("EPOXY_TOPIC_SUGGEST", "0").strip() == "1"
@@ -63,12 +66,12 @@ try:
 except ValueError:
     TOPIC_MIN_CONF = 0.85
 
-RESERVED_KIND_TAGS = {"decision", "policy", "canon"}
+RESERVED_KIND_TAGS = {"decision", "policy", "canon", "profile"}
 
 _DEFAULT_TOPIC_ALLOWLIST = (
     "ops,announcements,community,coaches,workshops,league,one_on_one,"
     "member_support,conflict_resolution,marketing,content,website,pricing,billing,"
-    "policies,canon,roadmap,infra,bugs,deployments,epoxy_bot,experiments,baby_brain,"
+    "roadmap,infra,bugs,deployments,epoxy_bot,experiments,baby_brain,"
     "console_bay,coaching_method,layer_model,telemetry,track_guides"
 )
 
@@ -397,6 +400,9 @@ def normalize_tags(tags: list[str]) -> list[str]:
     # stable + dedup
     return sorted(set(out))
 
+def subject_user_tag(user_id: int) -> str:
+    return f"subject:user:{int(user_id)}"
+
 def infer_tier(created_ts: int) -> int:
     """0=hot (0-24h), 1=warm (1-14d), 2=cold (14-90d), 3=archive (>90d)"""
     age = max(0, int(time.time()) - int(created_ts or 0))
@@ -509,6 +515,40 @@ def _mark_events_summarized_sync(conn: sqlite3.Connection, event_ids: list[int])
         tuple(event_ids)
     )
     conn.commit()
+
+async def recall_profile_for_user(user_id: int, limit: int = 6) -> list[dict]:
+    if not stage_at_least("M1"):
+        return []
+    tag = subject_user_tag(user_id)
+    async with db_lock:
+        return await asyncio.to_thread(_search_memory_events_by_tag_sync, db_conn, tag, "profile", limit)
+
+def _search_memory_events_by_tag_sync(conn, subject_tag: str, kind_tag: str, limit: int) -> list[dict]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, created_at_utc, channel_name, author_name, text, tags_json, importance, topic_id
+        FROM memory_events
+        WHERE tags_json LIKE ? AND tags_json LIKE ?
+        ORDER BY created_ts DESC
+        LIMIT ?
+        """,
+        (f'%"{subject_tag}"%', f'%"{kind_tag}"%', int(limit)),
+    )
+    rows = cur.fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r[0],
+            "created_at_utc": r[1],
+            "channel_name": r[2],
+            "author_name": r[3],
+            "text": r[4],
+            "tags": json.loads(r[5] or "[]"),
+            "importance": r[6],
+            "topic_id": r[7],
+        })
+    return out
 
 def _upsert_summary_sync(conn: sqlite3.Connection, payload: dict) -> int:
     """Upsert by (topic_id). Keeps a single rolling summary per topic for now."""
@@ -805,6 +845,20 @@ def _set_backfill_done_sync(conn: sqlite3.Connection, channel_id: int, iso_utc: 
         (channel_id, iso_utc)
     )
     conn.commit()
+
+def _reset_backfill_done_sync(conn, channel_id: int) -> None:
+    cur = conn.cursor()
+    # Match whatever you used in _set_backfill_done_sync: usually key='backfill_done'
+    cur.execute(
+        "DELETE FROM channel_state WHERE channel_id = ? AND key = ?",
+        (int(channel_id), "backfill_done"),
+    )
+    conn.commit()
+
+async def reset_backfill_done(channel_id: int) -> None:
+    async with db_lock:
+        await asyncio.to_thread(_reset_backfill_done_sync, db_conn, int(channel_id))
+
 def _fetch_recent_context_sync(
     conn: sqlite3.Connection,
     channel_id: int,
@@ -1142,6 +1196,30 @@ def format_memory_for_llm(events: list[dict], summaries: list[dict], max_chars: 
     out = "\n".join(lines).strip()
     return out[:max_chars] if len(out) > max_chars else out
 
+def format_profile_for_llm(user_blocks: list[tuple[int, str, list[dict]]], max_chars: int = 900) -> str:
+    """
+    user_blocks: [(user_id, display_name, events), ...]
+    """
+    if not user_blocks:
+        return ""
+
+    lines: list[str] = ["Profile notes (curated):"]
+    for user_id, display_name, events in user_blocks:
+        if not events:
+            continue
+        lines.append(f"- <@{user_id}> ({display_name}):")
+        for e in events:
+            when = e.get("created_at_utc") or ""
+            who = e.get("author_name") or ""
+            ch = e.get("channel_name") or ""
+            txt = (e.get("text") or "").strip()
+            if txt:
+                lines.append(f"  • [{when}] {who} #{ch} :: {txt}")
+        lines.append("")
+
+    out = "\n".join(lines).strip()
+    return out[:max_chars] if len(out) > max_chars else out
+
 async def summarize_topic(topic_id: str, *, min_age_days: int = 14) -> str:
     """
     M3: consolidate important (importance=1) events for a topic into a rolling summary.
@@ -1475,6 +1553,58 @@ async def summarize_cmd(ctx: commands.Context, topic_id: str = "", min_age_days:
     out = await summarize_topic(topic_id, min_age_days=min_age_days)
     await send_chunked(ctx.channel, f"```\\n{out[:1700]}\\n```")
 
+@bot.command(name="profile")
+async def cmd_profile(ctx, *, raw: str = ""):
+    """
+    Save a profile memory about a person.
+    Usage: !profile @User | text
+           !profile 123456789012345678 | text
+    """
+    if not raw:
+        await ctx.send("Usage: !profile @User | text")
+        return
+
+    if ctx.channel.id not in ALLOWED_CHANNEL_IDS:
+        return
+
+    if "|" not in raw:
+        await ctx.send("Usage: !profile @User | text")
+        return
+
+    left, text = [s.strip() for s in raw.split("|", 1)]
+    if not text:
+        await ctx.send("Usage: !profile @User | text")
+        return
+
+    user_id = None
+    if ctx.message.mentions:
+        user_id = ctx.message.mentions[0].id
+    else:
+        m = re.search(r"\b(\d{8,20})\b", left)
+        if m:
+            user_id = int(m.group(1))
+
+    if not user_id:
+        await ctx.send("Couldn't find a user. Usage: !profile @User | text")
+        return
+
+    tags = [subject_user_tag(user_id), "profile"]
+
+    res = await remember_event(
+        text=text,
+        tags=tags,
+        importance=1,
+        message=ctx.message,
+        topic_hint=None,
+    )
+
+    if not res:
+        await ctx.send("Profile memory not saved (stage may be < M1).")
+        return
+
+    await ctx.send(f"Saved profile memory for <@{user_id}>.")
+
+
 # Backfill config
 BACKFILL_LIMIT = int(os.getenv("EPOXY_BACKFILL_LIMIT", "2000"))  # per channel, first boot
 BACKFILL_PAUSE_EVERY = 200
@@ -1489,25 +1619,34 @@ async def backfill_channel(channel: discord.abc.Messageable) -> None:
 
     channel_id = channel.id
     if channel_id not in ALLOWED_CHANNEL_IDS:
-        print(f"[Backfill] Skip channel {channel_id}: not in ALLOWED_CHANNEL_IDS")
         return
+
+    if BOOTSTRAP_CHANNEL_RESET:
+        await reset_backfill_done(channel_id)
 
     if await is_backfill_done(channel_id):
-        print(f"[Backfill] Skip channel {channel_id}: already marked done")
         return
 
-    print(f"[Backfill] Starting channel {channel_id} ({getattr(channel, 'name', 'unknown')}) limit={BACKFILL_LIMIT}")
+    print(f"[Backfill] Starting channel {channel_id} ({getattr(channel, 'name', 'unknown')}) "
+          f"limit={BACKFILL_LIMIT} bootstrap_capture={BOOTSTRAP_BACKFILL_CAPTURE}")
 
     count = 0
+    captured = 0
     try:
-        # oldest_first=True so inserts happen chronologically
         async for msg in channel.history(limit=BACKFILL_LIMIT, oldest_first=True):
-            # Skip OTHER bots, but keep Epoxy's own messages for context coherence
+            # Skip other bots but keep Epoxy for context coherence
             if msg.author.bot and bot.user and msg.author.id != bot.user.id:
                 continue
+
             await log_message(msg)
-            # OPTIONAL: if you want historical auto-capture into memory_events
-            await maybe_auto_capture(msg)
+
+            if BOOTSTRAP_BACKFILL_CAPTURE and stage_at_least("M1"):
+                # auto-capture only captures decision/policy/canon/#mem patterns by default
+                await maybe_auto_capture(msg)
+                # maybe_auto_capture doesn't return a boolean; if you want counts,
+                # you can add a return value later. For now just track messages processed.
+                captured += 1
+
             count += 1
             if count % BACKFILL_PAUSE_EVERY == 0:
                 await asyncio.sleep(BACKFILL_PAUSE_SECONDS)
@@ -1516,7 +1655,8 @@ async def backfill_channel(channel: discord.abc.Messageable) -> None:
         return
 
     await mark_backfill_done(channel_id)
-    print(f"[Backfill] Done channel {channel_id}. Logged {count} messages.")
+    print(f"[Backfill] Done channel {channel_id}. Logged {count} messages. BootstrapProcessed={captured}")
+
 async def maybe_auto_capture(message: discord.Message) -> None:
     """Optional heuristics to store high-signal items without manual commands."""
     if not (AUTO_CAPTURE and stage_at_least("M1")):
@@ -1616,6 +1756,34 @@ async def on_message(message: discord.Message):
                 scope = infer_scope(safe_prompt) if stage_at_least("M2") else "auto"
                 events, summaries = await recall_memory(safe_prompt, scope=scope)
                 memory_pack = format_memory_for_llm(events, summaries, max_chars=MAX_MSG_CONTENT)
+                            # --- Profile recall (profile kind) ---
+                profile_pack = ""
+                if stage_at_least("M1"):
+                    user_blocks: list[tuple[int, str, list[dict]]] = []
+
+                    # Author profile notes
+                    author_id = message.author.id
+                    author_name = str(message.author)
+                    author_events = await recall_profile_for_user(author_id, limit=6)
+                    if author_events:
+                        user_blocks.append((author_id, author_name, author_events))
+
+                    # Mentioned users' profile notes (excluding Epoxy/bots)
+                    for u in message.mentions:
+                        if bot.user and u.id == bot.user.id:
+                            continue
+                        if getattr(u, "bot", False):
+                            continue
+                        # avoid duplicates (e.g., if author is also mentioned)
+                        if u.id == author_id:
+                            continue
+                        u_events = await recall_profile_for_user(u.id, limit=6)
+                        if u_events:
+                            user_blocks.append((u.id, str(u), u_events))
+
+                    if user_blocks:
+                        # keep this smaller than memory_pack to avoid bloating context
+                        profile_pack = format_profile_for_llm(user_blocks, max_chars=min(900, MAX_MSG_CONTENT))
                 if len(memory_pack) > MAX_MSG_CONTENT:
                     memory_pack = memory_pack[:MAX_MSG_CONTENT]
 
@@ -1651,6 +1819,14 @@ async def on_message(message: discord.Message):
                     {
                         "role": "system",
                         "content": f"Relevant persistent memory:\n{memory_pack}"[:MAX_MSG_CONTENT],
+                    }
+                )
+            
+            if stage_at_least("M1") and profile_pack:
+                chat_messages.append(
+                    {
+                        "role": "system",
+                        "content": f"{profile_pack}"[:MAX_MSG_CONTENT],
                     }
                 )
 
