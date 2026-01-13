@@ -852,6 +852,19 @@ def _set_backfill_done_sync(conn: sqlite3.Connection, channel_id: int, iso_utc: 
     )
     conn.commit()
 
+BOOTSTRAP_CHANNEL_RESET_ALL = os.getenv("EPOXY_BOOTSTRAP_CHANNEL_RESET_ALL", "0").strip() == "1"
+
+def _reset_all_backfill_done_sync(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE channel_state SET backfill_done = 0, last_backfill_at_utc = NULL"
+    )
+    conn.commit()
+
+async def reset_all_backfill_done() -> None:
+    async with db_lock:
+        await asyncio.to_thread(_reset_all_backfill_done_sync, db_conn)
+
 def _reset_backfill_done_sync(conn: sqlite3.Connection, channel_id: int) -> None:
     cur = conn.cursor()
     # If a row exists, flip the flag off and clear timestamp.
@@ -1701,6 +1714,9 @@ async def maybe_auto_capture(message: discord.Message) -> None:
 @bot.event
 async def on_ready():
     print(f"Epoxy is online as {bot.user}")
+    if BOOTSTRAP_CHANNEL_RESET_ALL:
+        await reset_all_backfill_done()
+        print ("[Backfill] Reset ALL backfill_done flags (bootstrap)")
     # One-time backfill for each allowed channel (only if not already done in DB)
     for channel_id in ALLOWED_CHANNEL_IDS:
         ch = bot.get_channel(channel_id)
