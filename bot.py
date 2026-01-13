@@ -47,7 +47,7 @@ import re
 # Stage gating (default conservative; set env to enable higher stages)
 MEMORY_STAGE = os.getenv("EPOXY_MEMORY_STAGE", "M0").strip().upper()
 STAGE_RANK = {"M0": 0, "M1": 1, "M2": 2, "M3": 3}
-MEMORY_STAGE_RANK = STAGE_RANK.get(MEMORY_STAGE, 3)
+MEMORY_STAGE_RANK = STAGE_RANK.get(MEMORY_STAGE, 0)
 
 def stage_at_least(stage: str) -> bool:
     return MEMORY_STAGE_RANK >= STAGE_RANK.get(stage.strip().upper(), 0)
