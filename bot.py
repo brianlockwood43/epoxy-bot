@@ -1210,9 +1210,9 @@ def format_memory_for_llm(events: list[dict], summaries: list[dict], max_chars: 
         lines.append("Event memories:")
         for e in events:
             tags = ",".join(e.get("tags") or [])
-            when = e.get("created_at_utc") or ""
-            ch = e.get("channel_name") or ""
-            who = e.get("author_name") or ""
+            when = e.get("created_at_utc") or "unknown-date"
+            ch = e.get("channel_name") or "unknown-channel"
+            who = e.get("author_name") or "unknown-author"
             imp = "!" if int(e.get("importance") or 0) == 1 else ""
             topic = (e.get('topic_id') or '')
             topic_meta = f"topic={topic} " if topic else ''
@@ -1861,7 +1861,10 @@ async def on_message(message: discord.Message):
                         "(2) Relevant persistent memory (if provided), and "
                         "(3) Topic summaries (if provided). "
                         "Do not rely on general knowledge. "
-                        "If the provided context is insufficient, say so and ask 1 clarifying question."
+                        "If the provided context is insufficient, say so and ask 1 clarifying question. \n\n"
+                        "CRITICAL ATTRIBUTION RULE: Do NOT invent metadata (channel name, user, date, message source). "
+                        "If a detail is not explicitly present in the provided context/memory, label it as unknown "
+                        "(e.g. 'unknown channel') rather than guessing. "
                     )[:MAX_MSG_CONTENT],
                 },
                 {
