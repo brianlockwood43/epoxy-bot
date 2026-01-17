@@ -308,16 +308,22 @@ def init_db(db_path: str) -> sqlite3.Connection:
         "ALTER TABLE memory_events ADD COLUMN topic_id TEXT",
         "ALTER TABLE memory_events ADD COLUMN topic_source TEXT DEFAULT 'manual'",
         "ALTER TABLE memory_events ADD COLUMN topic_confidence REAL",
+        "ALTER TABLE memory_events ADD COLUMN logged_from_channel_id INTEGER",
+        "ALTER TABLE memory_events ADD COLUMN logged_from_channel_name TEXT",
+        "ALTER TABLE memory_events ADD COLUMN logged_from_message_id INTEGER",
+
+        "ALTER TABLE memory_events ADD COLUMN source_channel_id INTEGER",
+        "ALTER TABLE memory_events ADD COLUMN source_channel_name TEXT",
     ]:
         try:
             cur.execute(stmt)
-        except Exception:
+        except sqlite3.OperationalError:
             pass
 
     # Best-effort backfill: set topic_id from first tag when possible.
     try:
         cur.execute("UPDATE memory_events SET topic_id = json_extract(tags_json, '$[0]') WHERE (topic_id IS NULL OR topic_id='') AND tags_json IS NOT NULL AND tags_json != '[]'")
-    except Exception:
+    except sqlite3.OperationalError:
         pass
 
 
@@ -472,23 +478,34 @@ def _insert_memory_event_sync(conn: sqlite3.Connection, payload: dict) -> int:
             source_message_id,
             text, tags_json, importance, tier,
             topic_id, topic_source, topic_confidence,
-            summarized
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            summarized,
+            logged_from_channel_id, logged_from_channel_name, logged_from_message_id,
+            source_channel_id, source_channel_name
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            payload["created_at_utc"], payload["created_ts"],
-            payload.get("guild_id"), payload.get("channel_id"), payload.get("channel_name"),
-            payload.get("author_id"), payload.get("author_name"),
+            payload["created_at_utc"],
+            payload["created_ts"],
+            payload.get("guild_id"),
+            payload.get("channel_id"),
+            payload.get("channel_name"),
+            payload.get("author_id"),
+            payload.get("author_name"),
             payload.get("source_message_id"),
             payload["text"],
             payload.get("tags_json", "[]"),
             int(payload.get("importance", 0)),
             int(payload.get("tier", 1)),
             payload.get("topic_id"),
-            payload.get("topic_source", "manual"),
+            payload.get("topic_source", "none"),
             payload.get("topic_confidence"),
             int(payload.get("summarized", 0)),
-        )
+            payload.get("logged_from_channel_id"),
+            payload.get("logged_from_channel_name"),
+            payload.get("logged_from_message_id"),
+            payload.get("source_channel_id"),
+            payload.get("source_channel_name"),
+        ),
     )
     mem_id = int(cur.lastrowid)
 
@@ -501,7 +518,7 @@ def _insert_memory_event_sync(conn: sqlite3.Connection, payload: dict) -> int:
 
     cur.execute(
         "INSERT INTO memory_events_fts(rowid, text, tags) VALUES (?, ?, ?)",
-        (mem_id, payload["text"], tags_for_fts)
+        (mem_id, payload["text"], tags_for_fts),
     )
     conn.commit()
     return mem_id
@@ -621,29 +638,53 @@ def _search_memory_events_sync(conn: sqlite3.Connection, query: str, scope: str,
         allowed_tiers = (0, 1, 2, 3)
 
     cur = conn.cursor()
+
     # Pull a wider set, then apply our scoring in Python.
+    # IMPORTANT: apply allowed tiers at SQL level to reduce junk work.
+    tier_placeholders = ",".join("?" for _ in allowed_tiers)
+
     cur.execute(
-        """
-        SELECT me.id, me.created_at_utc, me.created_ts, me.channel_name, me.author_name,
-               me.text, me.tags_json, me.importance, me.tier, me.topic_id, me.topic_source, me.topic_confidence,
+        f"""
+        SELECT me.id, me.created_at_utc, me.created_ts,
+               me.channel_id, me.channel_name,
+               me.author_id, me.author_name,
+               me.source_message_id,
+               me.text, me.tags_json, me.importance, me.tier,
+               me.topic_id, me.topic_source, me.topic_confidence,
+
+               me.logged_from_channel_id, me.logged_from_channel_name, me.logged_from_message_id,
+               me.source_channel_id, me.source_channel_name,
+
                bm25(memory_events_fts) as rank
         FROM memory_events_fts
         JOIN memory_events me ON me.id = memory_events_fts.rowid
         WHERE memory_events_fts MATCH ?
-          AND me.tier IN (0,1,2,3)
+          AND me.tier IN ({tier_placeholders})
         LIMIT 60
         """,
-        (fts_q,)
+        (fts_q, *allowed_tiers),
     )
     rows = cur.fetchall()
 
     scored: list[tuple[float, dict]] = []
     now = int(time.time())
 
-    for (mid, created_at_utc, created_ts, channel_name, author_name, text, tags_json, importance, tier, topic_id, topic_source, topic_confidence, rank) in rows:
+    for (
+        mid, created_at_utc, created_ts,
+        channel_id, channel_name,
+        author_id, author_name,
+        source_message_id,
+        text, tags_json, importance, tier,
+        topic_id, topic_source, topic_confidence,
+        logged_from_channel_id, logged_from_channel_name, logged_from_message_id,
+        source_channel_id, source_channel_name,
+        rank,
+    ) in rows:
+
         tier = int(tier or 1)
         if tier not in allowed_tiers:
             continue
+
         importance = int(importance or 0)
 
         # Stage-aware retention: ignore junk that's far past the ladder intent.
@@ -657,7 +698,7 @@ def _search_memory_events_sync(conn: sqlite3.Connection, query: str, scope: str,
                 continue
 
         base = -float(rank or 0.0)
-        recency_boost = 0.0
+
         if tier == 0:
             recency_boost = 2.0
         elif tier == 1:
@@ -668,20 +709,42 @@ def _search_memory_events_sync(conn: sqlite3.Connection, query: str, scope: str,
             recency_boost = 0.0
 
         importance_boost = 2.0 if importance == 1 else 0.0
-
         score = base + recency_boost + importance_boost
 
-        scored.append((score, {
-            "id": int(mid),
-            "created_at_utc": created_at_utc,
-            "created_ts": int(created_ts or 0),
-            "channel_name": channel_name,
-            "author_name": author_name,
-            "text": text,
-            "tags": safe_json_loads(tags_json),
-            "importance": importance,
-            "tier": tier,
-        }))
+        scored.append(
+            (
+                score,
+                {
+                    "id": int(mid),
+                    "created_at_utc": created_at_utc,
+                    "created_ts": int(created_ts or 0),
+
+                    # back-compat + utility
+                    "channel_id": channel_id,
+                    "channel_name": channel_name,
+                    "author_id": author_id,
+                    "author_name": author_name,
+                    "source_message_id": source_message_id,
+
+                    "text": text,
+                    "tags": safe_json_loads(tags_json),
+                    "importance": importance,
+                    "tier": tier,
+
+                    # topic metadata (previously fetched but discarded)
+                    "topic_id": topic_id,
+                    "topic_source": topic_source,
+                    "topic_confidence": topic_confidence,
+
+                    # provenance (new)
+                    "logged_from_channel_id": logged_from_channel_id,
+                    "logged_from_channel_name": logged_from_channel_name,
+                    "logged_from_message_id": logged_from_message_id,
+                    "source_channel_id": source_channel_id,
+                    "source_channel_name": source_channel_name,
+                },
+            )
+        )
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [d for _, d in scored[:limit]]
@@ -959,6 +1022,53 @@ async def get_recent_channel_context(channel_id: int, before_message_id: int) ->
     text = _format_recent_context(rows, RECENT_CONTEXT_MAX_CHARS, MAX_LINE_CHARS)
     return text, len(rows)
 
+def _fetch_latest_messages_sync(
+    conn: sqlite3.Connection,
+    channel_id: int,
+    limit: int,
+) -> list[tuple[str, str, str]]:
+    """
+    Returns newest-first list of (created_at_utc, author_name, content).
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT created_at_utc, author_name, content
+        FROM messages
+        WHERE channel_id = ?
+          AND content IS NOT NULL
+          AND TRIM(content) != ''
+        ORDER BY message_id DESC
+        LIMIT ?
+        """,
+        (int(channel_id), int(limit)),
+    )
+    return cur.fetchall()
+
+
+def _set_memory_origin_sync(
+    conn: sqlite3.Connection,
+    mem_id: int,
+    source_channel_id: int | None,
+    source_channel_name: str | None,
+) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE memory_events
+        SET source_channel_id = ?,
+            source_channel_name = ?
+        WHERE id = ?
+        """,
+        (source_channel_id, source_channel_name, int(mem_id)),
+    )
+    conn.commit()
+
+
+async def set_memory_origin(mem_id: int, source_channel_id: int | None, source_channel_name: str | None) -> None:
+    async with db_lock:
+        await asyncio.to_thread(_set_memory_origin_sync, db_conn, int(mem_id), source_channel_id, source_channel_name)
+
 # =========================
 # TOPIC SUGGESTION (late-M3)
 # =========================
@@ -1027,6 +1137,51 @@ def _safe_extract_json_obj(text: str) -> dict | None:
         return _json.loads(m.group(0))
     except Exception:
         return None
+    
+def _parse_channel_id_token(token: str) -> int | None:
+    token = (token or "").strip()
+    if not token:
+        return None
+    # Channel mention: <#1234567890>
+    m = re.match(r"^<#!?(\d{8,20})>$", token)
+    if m:
+        return int(m.group(1))
+    # Raw digits
+    m2 = re.match(r"^(\d{8,20})$", token)
+    if m2:
+        return int(m2.group(1))
+    return None
+
+
+def _extract_json_array(text: str) -> list[dict]:
+    """
+    Strict-ish: tries json.loads; if it fails, extracts the first [...] block and loads that.
+    """
+    import json
+
+    if not text:
+        return []
+    text = text.strip()
+
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, list) else []
+    except Exception:
+        pass
+
+    # Try to salvage: find outermost [ ... ]
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        blob = text[start : end + 1]
+        try:
+            data = json.loads(blob)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    return []
+
 
 
 async def _suggest_topic_id(text: str, candidates: list[str]) -> tuple[str | None, float]:
@@ -1136,15 +1291,34 @@ async def remember_event(
     author_id = None
     author_name = None
     source_message_id = None
+    logged_from_channel_id = None
+    logged_from_channel_name = None
+    logged_from_message_id = None
+
+    source_channel_id = None
+    source_channel_name = None
 
     if message is not None:
         created_dt = message.created_at if message.created_at else None
         guild_id = message.guild.id if message.guild else None
+
+        # Where the memory was captured (command / auto-capture)
+        logged_from_channel_id = message.channel.id
+        logged_from_channel_name = getattr(message.channel, "name", str(message.channel))
+        logged_from_message_id = message.id
+
+        # Backward compatible fields (keep for now)
         channel_id = message.channel.id
         channel_name = getattr(message.channel, "name", str(message.channel))
+        source_message_id = message.id
+
         author_id = message.author.id
         author_name = str(message.author)
-        source_message_id = message.id
+
+        # If you don't yet support origin overrides, default origin to "unknown"
+        # (or set it equal to logged_from if you prefer).
+        source_channel_id = None
+        source_channel_name = None
 
     created_ts = utc_ts(created_dt) if created_dt else utc_ts()
     tier = infer_tier(created_ts) if stage_at_least("M2") else 1
@@ -1153,11 +1327,21 @@ async def remember_event(
         "created_at_utc": utc_iso(created_dt) if created_dt else utc_iso(),
         "created_ts": created_ts,
         "guild_id": guild_id,
+
+        # Backward compatibility
         "channel_id": channel_id,
         "channel_name": channel_name,
+        "source_message_id": source_message_id,
+
+        # New provenance
+        "logged_from_channel_id": logged_from_channel_id,
+        "logged_from_channel_name": logged_from_channel_name,
+        "logged_from_message_id": logged_from_message_id,
+        "source_channel_id": source_channel_id,
+        "source_channel_name": source_channel_name,
+
         "author_id": author_id,
         "author_name": author_name,
-        "source_message_id": source_message_id,
         "text": (text or "").strip(),
         "tags_json": safe_json_dumps(tags),
         "importance": int(1 if importance else 0),
@@ -1210,13 +1394,43 @@ def format_memory_for_llm(events: list[dict], summaries: list[dict], max_chars: 
         lines.append("Event memories:")
         for e in events:
             tags = ",".join(e.get("tags") or [])
+
             when = e.get("created_at_utc") or "unknown-date"
             ch = e.get("channel_name") or "unknown-channel"
             who = e.get("author_name") or "unknown-author"
             imp = "!" if int(e.get("importance") or 0) == 1 else ""
-            topic = (e.get('topic_id') or '')
-            topic_meta = f"topic={topic} " if topic else ''
-            lines.append(f"- [{when}] {imp}{who} #{ch} {topic_meta}tags=[{tags}] :: {e['text'].strip()}")
+
+            topic = (e.get("topic_id") or "")
+            topic_meta = f"topic={topic} " if topic else ""
+
+            # --- Provenance (explicit; never guess) ---
+            # logged_from = where Epoxy captured the memory (command/auto-capture channel)
+            logged_from_ch = e.get("logged_from_channel_name") or e.get("channel_name") or "unknown-channel"
+            logged_from_id = e.get("logged_from_channel_id") or e.get("channel_id")
+            logged_from = f"#{logged_from_ch}" if logged_from_ch else "unknown-channel"
+            if logged_from_id:
+                logged_from = f"{logged_from}({logged_from_id})"
+
+            # origin = where the underlying idea/message originally occurred (if tracked separately)
+            origin_ch = e.get("source_channel_name")
+            origin_id = e.get("source_channel_id")
+            if origin_ch or origin_id:
+                origin = f"#{origin_ch or 'unknown-channel'}"
+                if origin_id:
+                    origin = f"{origin}({origin_id})"
+            else:
+                origin = "unknown"
+
+            src_msg = e.get("source_message_id")
+            src_meta = f" msg={src_msg}" if src_msg else ""
+
+            prov = f"prov=logged_from:{logged_from} origin:{origin}{src_meta} "
+
+            text = (e.get("text") or "").strip()
+
+            lines.append(
+                f"- [{when}] {imp}{who} {prov}{topic_meta}tags=[{tags}] :: {text}"
+            )
 
     out = "\n".join(lines).strip()
     return out[:max_chars] if len(out) > max_chars else out
@@ -1234,9 +1448,9 @@ def format_profile_for_llm(user_blocks: list[tuple[int, str, list[dict]]], max_c
             continue
         lines.append(f"- <@{user_id}> ({display_name}):")
         for e in events:
-            when = e.get("created_at_utc") or ""
-            who = e.get("author_name") or ""
-            ch = e.get("channel_name") or ""
+            when = e.get("created_at_utc") or "unknown-date"
+            who = e.get("author_name") or "unknown-author"
+            ch = e.get("channel_name") or "unknown-channel"
             txt = (e.get("text") or "").strip()
             if txt:
                 lines.append(f"  • [{when}] {who} #{ch} :: {txt}")
@@ -1653,6 +1867,186 @@ async def cmd_memfind(ctx, *, q: str):
     events, summaries = await recall_memory(q, scope="auto")
     txt = format_memory_for_llm(events, summaries, max_chars=1800)
     await ctx.send(f"Recall results for: {q}\n{txt}"[:1900])
+
+# NEED TO ADD channel_state.last_mined_message_id later to enable "mine from last cursor" funtionality
+# NEED TO ADD profile referencing via ID, currently profiles are referenced by text and sometimes only first names which will get flimsy later
+@bot.command(name="mine")
+async def cmd_mine(ctx, *args):
+    """
+    Mine high-signal memories from the messages table.
+
+    Usage:
+      !mine
+      !mine <channel_id>
+      !mine <#channel>
+      !mine <channel_id> <limit>
+      !mine <#channel> <limit>
+
+    Notes:
+      - Runs from any channel, but will only mine channels in ALLOWED_CHANNEL_IDS.
+      - Stores mined items as memory_events via remember_event().
+      - Sets origin provenance to the mined channel (source_channel_id/source_channel_name).
+    """
+    if ctx.channel.id not in ALLOWED_CHANNEL_IDS:
+        await ctx.send("This command isn't enabled in this channel.")
+        return
+
+    if not stage_at_least("M1"):
+        await ctx.send("Memory is not enabled (stage < M1).")
+        return
+
+    # Defaults
+    target_channel_id = ctx.channel.id
+    limit = 200  # default mining window size
+
+    # Parse args: first token may be channel; second may be limit
+    if len(args) >= 1:
+        maybe_ch = _parse_channel_id_token(args[0])
+        if maybe_ch:
+            target_channel_id = maybe_ch
+            if len(args) >= 2 and str(args[1]).isdigit():
+                limit = max(50, min(500, int(args[1])))
+        elif str(args[0]).isdigit():
+            # could be a limit
+            limit = max(50, min(500, int(args[0])))
+
+    if target_channel_id not in ALLOWED_CHANNEL_IDS:
+        await ctx.send("That channel is not in Epoxy's allowlist, so I won't mine it.")
+        return
+
+    # Resolve channel name for provenance (best effort)
+    target_channel_name = None
+    ch_obj = bot.get_channel(target_channel_id)
+    if ch_obj is None:
+        try:
+            ch_obj = await bot.fetch_channel(target_channel_id)
+        except Exception:
+            ch_obj = None
+    if ch_obj is not None:
+        target_channel_name = getattr(ch_obj, "name", None) or str(ch_obj)
+
+    # Fetch window from DB
+    async with db_lock:
+        rows = await asyncio.to_thread(_fetch_latest_messages_sync, db_conn, target_channel_id, limit)
+
+    if not rows:
+        await ctx.send("No messages found to mine for that channel.")
+        return
+
+    # Convert to chronological text block (oldest -> newest)
+    # Use your existing formatter to keep consistent line shapes.
+    window_text = _format_recent_context(rows, max_chars=12000, max_line_chars=350)
+
+    # Build strict extraction prompt
+    allowlist = TOPIC_ALLOWLIST[:] if TOPIC_ALLOWLIST else []
+    allowlist_str = ", ".join(allowlist) if allowlist else "(none; use null topic_id)"
+
+    extraction_instructions = f"""
+You are Epoxy's memory miner.
+
+You will be given a block of Discord messages from ONE channel.
+Extract durable, high-signal MEMORY EVENTS only. Do NOT extract chatter unless you are extracting an inside joke, social pattern, or another similar abstraction.
+
+Return a JSON ARRAY ONLY (no markdown, no commentary), with 0-12 items.
+Each item must be an object with EXACT keys:
+- "text": string (max 240 chars), the memory content written as a standalone statement
+- "kind": one of ["decision","policy","canon","profile","proposal","insight","task"]
+- "topic_id": either null OR one of this allowlist: [{allowlist_str}]
+- "importance": 0 or 1 (1 only if it will matter weeks later)
+- "confidence": number 0.0-1.0
+
+Rules:
+- Do NOT invent channel names, dates, authors, or message ids. Do NOT include them in "text".
+- If you cannot confidently assign a topic_id from allowlist, use null.
+- Avoid duplicates / near-duplicates.
+- Prefer writing memories in a neutral factual style.
+- Only produce "profile" if the text is a stable trait or preference about an individual AND the individual's name appears in the window text.
+  For profile items, include the person's name inside "text" (e.g., "Sammy prefers ..."). Still no invented IDs.
+""".strip()
+
+    # Call LLM
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": extraction_instructions[:1900]},
+                {"role": "user", "content": f"Channel window:\n{window_text}"[:12000]},
+            ],
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        await ctx.send(f"Mine failed (LLM error): {e}")
+        return
+
+    items = _extract_json_array(raw)
+    if not items:
+        await ctx.send("Mine produced no usable JSON items.")
+        return
+
+    # Validate + insert
+    allowed_kinds = {"decision","policy","canon","profile","proposal","insight","task"}
+    allow_topics = set(TOPIC_ALLOWLIST or [])
+    saved = 0
+    topics_used: dict[str, int] = {}
+
+    for it in items:
+        try:
+            text = (it.get("text") or "").strip()
+            kind = (it.get("kind") or "").strip().lower()
+            topic_id = it.get("topic_id", None)
+            importance = int(it.get("importance", 0))
+            conf = float(it.get("confidence", 0.0))
+        except Exception:
+            continue
+
+        if not text:
+            continue
+        if kind not in allowed_kinds:
+            kind = "insight"
+        importance = 1 if importance == 1 else 0
+
+        # Topic must be allowlisted or null
+        if isinstance(topic_id, str):
+            topic_id = topic_id.strip().lower()
+            if topic_id not in allow_topics:
+                topic_id = None
+        else:
+            topic_id = None
+
+        # Conservative confidence gate (optional)
+        # If you want it stricter, raise this.
+        if conf < 0.55:
+            continue
+
+        # Build tags: keep kinds, optional topic tag
+        tags = [kind]
+        if topic_id:
+            tags = [topic_id] + tags
+
+        res = await remember_event(
+            text=text,
+            tags=tags,
+            importance=importance,
+            message=ctx.message,  # capture location
+            topic_hint=topic_id,  # ensures topic_id wins if set
+        )
+        if not res:
+            continue
+
+        # Set origin provenance to the mined channel (not the command channel)
+        await set_memory_origin(int(res["id"]), target_channel_id, target_channel_name)
+
+        saved += 1
+        if topic_id:
+            topics_used[topic_id] = topics_used.get(topic_id, 0) + 1
+
+    topic_summary = ", ".join(f"{k}×{v}" for k, v in sorted(topics_used.items(), key=lambda x: (-x[1], x[0])))
+    if not topic_summary:
+        topic_summary = "(none)"
+
+    await ctx.send(
+        f"🧴⛏️ Mined {len(rows)} msgs from <#{target_channel_id}> → saved {saved} memories. Topics: {topic_summary}"
+    )
 
 
 # Backfill config
