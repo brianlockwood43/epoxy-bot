@@ -1629,6 +1629,31 @@ async def cmd_profile(ctx, *, raw: str = ""):
 
     await ctx.send(f"Saved profile memory for <@{user_id}>.")
 
+@bot.command(name="memlast")
+async def cmd_memlast(ctx, n: int = 5):
+    if ctx.channel.id not in ALLOWED_CHANNEL_IDS:
+        return
+    async with db_lock:
+        rows = await asyncio.to_thread(_debug_last_memories_sync, db_conn, int(n))
+    lines = ["Last memories:"] + [f"- #{r['id']} topic={r['topic_id']} tags={r['tags']}\n  {r['text'][:120]}" for r in rows]
+    await ctx.send("\n".join(lines)[:1900])
+
+def _debug_last_memories_sync(conn, n: int):
+    cur = conn.cursor()
+    cur.execute("SELECT id, text, tags_json, topic_id FROM memory_events ORDER BY id DESC LIMIT ?", (int(n),))
+    out=[]
+    for i,t,tags,topic in cur.fetchall():
+        out.append({"id": i, "text": t or "", "tags": __import__("json").loads(tags or "[]"), "topic_id": topic or ""})
+    return out
+
+@bot.command(name="memfind")
+async def cmd_memfind(ctx, *, q: str):
+    if ctx.channel.id not in ALLOWED_CHANNEL_IDS:
+        return
+    events, summaries = await recall_memory(q, scope="auto")
+    txt = format_memory_for_llm(events, summaries, max_chars=1800)
+    await ctx.send(f"Recall results for: {q}\n{txt}"[:1900])
+
 
 # Backfill config
 BACKFILL_LIMIT = int(os.getenv("EPOXY_BACKFILL_LIMIT", "2000"))  # per channel, first boot
@@ -1693,7 +1718,7 @@ async def maybe_auto_capture(message: discord.Message) -> None:
     if not content:
         return
 
-    m = re.match(r"^(decision|policy|canon)\s*(\(([^)]+)\))?\s*:\s*(.+)$", content, flags=re.I)
+    m = re.match(r"^(decision|policy|canon|profile)\s*(\(([^)]+)\))?\s*:\s*(.+)$", content, flags=re.I)
     if m:
         kind = m.group(1).lower()
         topic = (m.group(3) or "").strip()
