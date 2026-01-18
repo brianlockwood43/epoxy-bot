@@ -2048,6 +2048,18 @@ Rules:
         f"🧴⛏️ Mined {len(rows)} msgs from <#{target_channel_id}> → saved {saved} memories. Topics: {topic_summary}"
     )
 
+@bot.command(name="ctxpeek")
+async def ctxpeek(ctx: commands.Context, n: int = 10):
+    if not _in_allowed_channel(ctx):
+        return
+    n = max(1, min(int(n), 40))
+    # Use a huge "before" so we get latest
+    before = 2**63 - 1
+    async with db_lock:
+        rows = await asyncio.to_thread(_fetch_recent_context_sync, db_conn, ctx.channel.id, before, n)
+    txt = _format_recent_context(rows, 1900, MAX_LINE_CHARS)
+    await ctx.send(f"Recent context ({len(rows)} rows):\n{txt}")
+
 
 # Backfill config
 BACKFILL_LIMIT = int(os.getenv("EPOXY_BACKFILL_LIMIT", "2000"))  # per channel, first boot
@@ -2158,26 +2170,26 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # If it's a bot message, log Epoxy's own messages for context, then stop.
-    if message.author.bot:
-        if bot.user and message.author.id == bot.user.id:
-            if message.channel.id in ALLOWED_CHANNEL_IDS:
-                await log_message(message)
-        return
-
+    # Ignore channels we don’t care about
     if message.channel.id not in ALLOWED_CHANNEL_IDS:
         return
 
+    # Log Epoxy’s own bot messages (so recent-context includes her questions/answers)
+    if message.author.bot:
+        if bot.user and message.author.id == bot.user.id:
+            await log_message(message)
+        return
+
+    # Always log human messages in allowed channels
     await log_message(message)
+
+    # Optional auto-capture of high-signal items into persistent memory
     await maybe_auto_capture(message)
 
-    # If it's a command, don't also do the mention/LLM response path.
-    if (message.content or "").lstrip().startswith("!"):
-        await bot.process_commands(message)
-        return
     # Only respond if mentioned
     if bot.user and bot.user in message.mentions:
-        prompt = message.content.replace(f"<@{bot.user.id}>", "").strip()
+        # Strip both <@id> and <@!id>
+        prompt = re.sub(rf"<@!?\s*{bot.user.id}\s*>", "", message.content or "").strip()
 
         if not prompt:
             await message.channel.send("Yep? 🧴")
@@ -2185,120 +2197,56 @@ async def on_message(message: discord.Message):
             return
 
         try:
-            MAX_MSG_CONTENT = 1900  # keep safely under the 2000-char hard limit
+            MAX_MSG_CONTENT = 1900
 
-            recent_context, ctx_rows = await get_recent_channel_context(message.channel.id, message.id)
+            recent_context, ctx_rows = await get_recent_channel_context(
+                message.channel.id, message.id
+            )
 
-            # Cap each field individually (the API limit applies per `messages[i].content`)
-            context_pack = build_context_pack()
-            if len(context_pack) > MAX_MSG_CONTENT:
-                context_pack = context_pack[:MAX_MSG_CONTENT]
+            context_pack = build_context_pack()[:MAX_MSG_CONTENT]
+            recent_context = recent_context[:MAX_MSG_CONTENT]
+            safe_prompt = prompt[:MAX_MSG_CONTENT]
 
-            if len(recent_context) > MAX_MSG_CONTENT:
-                recent_context = recent_context[:MAX_MSG_CONTENT]
-
-            # Also cap the user prompt (just in case someone pastes a novel)
-            safe_prompt = prompt[:MAX_MSG_CONTENT] if prompt else ""
-
-            # Persistent memory (M1+) — only included when enabled by stage
             memory_pack = ""
             if stage_at_least("M1"):
                 scope = infer_scope(safe_prompt) if stage_at_least("M2") else "auto"
                 events, summaries = await recall_memory(safe_prompt, scope=scope)
-                memory_pack = format_memory_for_llm(events, summaries, max_chars=MAX_MSG_CONTENT)
-                            # --- Profile recall (profile kind) ---
-                profile_pack = ""
-                if stage_at_least("M1"):
-                    user_blocks: list[tuple[int, str, list[dict]]] = []
-
-                    # Author profile notes
-                    author_id = message.author.id
-                    author_name = str(message.author)
-                    author_events = await recall_profile_for_user(author_id, limit=6)
-                    if author_events:
-                        user_blocks.append((author_id, author_name, author_events))
-
-                    # Mentioned users' profile notes (excluding Epoxy/bots)
-                    for u in message.mentions:
-                        if bot.user and u.id == bot.user.id:
-                            continue
-                        if getattr(u, "bot", False):
-                            continue
-                        # avoid duplicates (e.g., if author is also mentioned)
-                        if u.id == author_id:
-                            continue
-                        u_events = await recall_profile_for_user(u.id, limit=6)
-                        if u_events:
-                            user_blocks.append((u.id, str(u), u_events))
-
-                    if user_blocks:
-                        # keep this smaller than memory_pack to avoid bloating context
-                        profile_pack = format_profile_for_llm(user_blocks, max_chars=min(900, MAX_MSG_CONTENT))
-                if len(memory_pack) > MAX_MSG_CONTENT:
-                    memory_pack = memory_pack[:MAX_MSG_CONTENT]
+                memory_pack = format_memory_for_llm(events, summaries, max_chars=MAX_MSG_CONTENT)[:MAX_MSG_CONTENT]
 
             print(
                 f"[CTX] channel={message.channel.id} rows={ctx_rows} before={message.id} "
                 f"ctx_chars={len(recent_context)} pack_chars={len(context_pack)} prompt_chars={len(safe_prompt)} "
-                f"mem_chars={len(memory_pack)} stage={MEMORY_STAGE} "
-                f"limit={RECENT_CONTEXT_LIMIT}"
+                f"mem_chars={len(memory_pack)} stage={MEMORY_STAGE} limit={RECENT_CONTEXT_LIMIT}"
             )
 
             chat_messages = [
                 {"role": "system", "content": SYSTEM_PROMPT_BASE[:MAX_MSG_CONTENT]},
                 {"role": "system", "content": context_pack},
-                {
-                    "role": "system",
-                    "content": (
-                        "Use ONLY the context provided in this request: "
-                        "(1) Recent channel context, "
-                        "(2) Relevant persistent memory (if provided), and "
-                        "(3) Topic summaries (if provided). "
-                        "Do not rely on general knowledge. "
-                        "If the provided context is insufficient, say so and ask 1 clarifying question. \n\n"
-                        "CRITICAL ATTRIBUTION RULE: Do NOT invent metadata (channel name, user, date, message source). "
-                        "If a detail is not explicitly present in the provided context/memory, label it as unknown "
-                        "(e.g. 'unknown channel') rather than guessing. "
-                    )[:MAX_MSG_CONTENT],
-                },
-                {
-                    "role": "system",
-                    "content": f"Recent channel context:\n{recent_context}"[:MAX_MSG_CONTENT],
-                },
+                {"role": "system", "content": (
+                    "Use ONLY the context provided in this request: "
+                    "(1) Recent channel context, "
+                    "(2) Relevant persistent memory (if provided), and "
+                    "(3) Topic summaries (if provided). "
+                    "Do not rely on general knowledge. "
+                    "If the provided context is insufficient, say so and ask 1 clarifying question."
+                )[:MAX_MSG_CONTENT]},
+                {"role": "system", "content": f"Recent channel context:\n{recent_context}"[:MAX_MSG_CONTENT]},
             ]
 
             if stage_at_least("M1") and memory_pack:
-                chat_messages.append(
-                    {
-                        "role": "system",
-                        "content": f"Relevant persistent memory:\n{memory_pack}"[:MAX_MSG_CONTENT],
-                    }
-                )
-            
-            if stage_at_least("M1") and profile_pack:
-                chat_messages.append(
-                    {
-                        "role": "system",
-                        "content": f"{profile_pack}"[:MAX_MSG_CONTENT],
-                    }
-                )
+                chat_messages.append({"role": "system", "content": f"Relevant persistent memory:\n{memory_pack}"[:MAX_MSG_CONTENT]})
 
             chat_messages.append({"role": "user", "content": safe_prompt})
 
-            resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                # If you want less bubbly: uncomment temperature line and set low
-                # temperature=0.2,
-                messages=chat_messages,
-            )
-
+            resp = client.chat.completions.create(model=OPENAI_MODEL, messages=chat_messages)
             reply = resp.choices[0].message.content or "(no output)"
-            print(f"[REPLY] chars={len(reply)} parts={len(chunk_text(reply))}")
             await send_chunked(message.channel, reply)
+
         except Exception as e:
             print(f"[OpenAI] Error: {e}")
             await message.channel.send("Epoxy hiccuped. Check logs 🧴⚙️")
 
     await bot.process_commands(message)
+
 
 bot.run(DISCORD_TOKEN)
