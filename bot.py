@@ -2219,22 +2219,33 @@ async def on_message(message: discord.Message):
                 f"mem_chars={len(memory_pack)} stage={MEMORY_STAGE} limit={RECENT_CONTEXT_LIMIT}"
             )
 
+            INSTRUCTIONS = (
+                "Use ONLY the context provided in this request: "
+                "(1) Recent channel context, "
+                "(2) Relevant persistent memory (if provided), and "
+                "(3) Topic summaries (if provided). "
+                "Do not rely on general knowledge.\n"
+                "CRITICAL ATTRIBUTION RULE: Do NOT invent metadata (channel name, user, date, message id, source). "
+                "If a detail is not explicitly present, label it as unknown.\n"
+                "COREFERENCE RULE: If the user uses a pronoun (he/she/they/it/that) and the recent channel context "
+                "clearly names a single likely referent in the last 1–3 turns, assume that referent. "
+                "Ask a clarifying question ONLY if there are 2+ plausible referents in the last 3 turns.\n"
+                "If the provided context is insufficient to answer, say so and ask 1 clarifying question."
+            )[:MAX_MSG_CONTENT]
+
             chat_messages = [
                 {"role": "system", "content": SYSTEM_PROMPT_BASE[:MAX_MSG_CONTENT]},
                 {"role": "system", "content": context_pack},
-                {"role": "system", "content": (
-                    "Use ONLY the context provided in this request: "
-                    "(1) Recent channel context, "
-                    "(2) Relevant persistent memory (if provided), and "
-                    "(3) Topic summaries (if provided). "
-                    "Do not rely on general knowledge. "
-                    "If the provided context is insufficient, say so and ask 1 clarifying question."
-                )[:MAX_MSG_CONTENT]},
+                {"role": "system", "content": INSTRUCTIONS},
+                # Small continuity hint: prefer the most recent subject in Epoxy's last message
+                {"role": "system", "content": "Continuity: treat the subject of Epoxy's most recent message in the recent context as the default referent for follow-up questions unless the user clearly changes subject."[:MAX_MSG_CONTENT]},
                 {"role": "system", "content": f"Recent channel context:\n{recent_context}"[:MAX_MSG_CONTENT]},
             ]
 
             if stage_at_least("M1") and memory_pack:
-                chat_messages.append({"role": "system", "content": f"Relevant persistent memory:\n{memory_pack}"[:MAX_MSG_CONTENT]})
+                chat_messages.append(
+                    {"role": "system", "content": f"Relevant persistent memory:\n{memory_pack}"[:MAX_MSG_CONTENT]}
+                )
 
             chat_messages.append({"role": "user", "content": safe_prompt})
 
