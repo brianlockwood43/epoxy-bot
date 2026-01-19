@@ -2329,25 +2329,40 @@ async def cmd_topicsuggest(ctx, *args):
     existing_str = ", ".join(sorted(existing)) if existing else "(none)"
 
     prompt = f"""
-You are Epoxy's topic curator.
+    You are Epoxy's topic curator.
 
-Goal: propose NEW topic_ids to add to an allowlist for memory organization.
-You will be given either Discord message logs or memory event entries.
+    Goal: propose NEW topic_ids to add to an allowlist for organizing memories.
+    You will be given either Discord message logs or memory event entries.
 
-Return a JSON ARRAY ONLY (no markdown, no commentary), with 0-10 items.
-Each item must have EXACT keys:
-- "topic_id": snake_case string, 3-24 chars, [a-z0-9_], must NOT already exist
-- "label": short human label
-- "why": 1 sentence why this topic is distinct/useful
-- "examples": array of 2-3 short phrases quoted/paraphrased from the window (no invention)
-- "confidence": number 0.0-1.0
+    Return a JSON ARRAY ONLY (no markdown, no commentary), with 0-8 items.
+    Each item must have EXACT keys:
+    - "topic_id": snake_case string, 3-24 chars, [a-z0-9_], must NOT already exist
+    - "label": short human label
+    - "why": 1 sentence why this topic is distinct/useful
+    - "examples": array of 2-3 short phrases quoted/paraphrased from the window (no invention)
+    - "confidence": number 0.0-1.0
 
-Hard rules:
-- Do NOT propose any topic_id that is already in: [{existing_str}]
-- Do NOT invent themes not supported by the window.
-- Avoid overly broad topics ("general", "random", "chat").
-- Prefer stable recurring categories that would matter for weeks/months.
-""".strip()
+    HARD RULES:
+    - Do NOT propose any topic_id that is already in: [{existing_str}]
+    - Do NOT invent themes not supported by the window.
+    - Avoid overly broad topics ("general", "random", "chat").
+    - Avoid overly specific topics tied to a single person, single workshop, single document, or single one-off event.
+    - Each proposed topic MUST be supported by at least 3 distinct messages/memories in the window.
+    - Prefer topics that will still be useful 3+ months from now.
+
+    PREFERRED GRANULARITY (examples of the right size):
+    - epoxy_development (build/test/deploy/memory system)
+    - workshops (planning/running workshop ideas/format)
+    - student_challenges (coaching cases / recurring pain points)
+    - coaching_method (methods/models/frameworks)
+    - governance_and_comms (ethics/docs/guidelines/vibe/public copy)
+
+    If a candidate feels like a subtopic of one of the above sizes, propose the broader bucket instead.
+
+    Return JSON only.
+    """.strip()
+
+
 
     try:
         resp = client.chat.completions.create(
