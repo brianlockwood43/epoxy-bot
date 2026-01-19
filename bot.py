@@ -887,6 +887,72 @@ def _get_topic_summary_sync(conn: sqlite3.Connection, topic_id: str) -> dict | N
         "summary_text": summary_text,
     }
 
+def _fetch_latest_memory_events_sync(
+    conn: sqlite3.Connection,
+    limit: int,
+) -> list[tuple[str, str, str, str]]:
+    """
+    Returns newest-first list of (created_at_utc, author_name, channel_name, text)
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT created_at_utc, author_name, COALESCE(channel_name,''), text
+        FROM memory_events
+        WHERE text IS NOT NULL AND TRIM(text) != ''
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    )
+    return cur.fetchall()
+
+
+def _fetch_memory_events_since_sync(
+    conn: sqlite3.Connection,
+    since_iso_utc: str,
+    limit: int,
+) -> list[tuple[str, str, str, str]]:
+    """
+    Returns newest-first list of (created_at_utc, author_name, channel_name, text)
+    for memory_events with created_at_utc >= since_iso_utc.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT created_at_utc, author_name, COALESCE(channel_name,''), text
+        FROM memory_events
+        WHERE created_at_utc >= ?
+          AND text IS NOT NULL AND TRIM(text) != ''
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (since_iso_utc, int(limit)),
+    )
+    return cur.fetchall()
+
+def _format_memory_events_window(rows: list[tuple[str, str, str, str]], max_chars: int = 12000) -> str:
+    if not rows:
+        return "(no memory events)"
+    rows = list(reversed(rows))  # chronological
+    out_lines = []
+    total = 0
+    for created_at_utc, author_name, channel_name, text in rows:
+        ts = created_at_utc
+        if ts and "T" in ts:
+            try:
+                ts = ts.split("T", 1)[1][:5]
+            except Exception:
+                pass
+        ch = channel_name or "unknown-channel"
+        who = author_name or "unknown-author"
+        clean = " ".join((text or "").split())
+        line = f"[{ts}] {who} #{ch} :: {clean}"
+        if total + len(line) + 1 > max_chars:
+            break
+        out_lines.append(line)
+        total += len(line) + 1
+    return "\n".join(out_lines)
 
 
 def _get_backfill_done_sync(conn: sqlite3.Connection, channel_id: int) -> tuple[bool, str | None]:
@@ -972,6 +1038,42 @@ def _fetch_recent_context_sync(
     )
     return cur.fetchall()
 
+def _fetch_messages_since_sync(
+    conn: sqlite3.Connection,
+    channel_id: int,
+    since_iso_utc: str,
+    limit: int,
+) -> list[tuple[str, str, str]]:
+    """
+    Returns newest-first list of (created_at_utc, author_name, content)
+    for messages with created_at_utc >= since_iso_utc.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT created_at_utc, author_name, content
+        FROM messages
+        WHERE channel_id = ?
+          AND created_at_utc >= ?
+          AND content IS NOT NULL
+          AND TRIM(content) != ''
+        ORDER BY message_id DESC
+        LIMIT ?
+        """,
+        (int(channel_id), since_iso_utc, int(limit)),
+    )
+    return cur.fetchall()
+
+def _parse_duration_to_minutes(token: str) -> int | None:
+    t = (token or "").strip().lower()
+    if t in {"hot", "--hot"}:
+        return 30  # default hot window
+    m = re.match(r"^(\d{1,3})\s*([mh])$", t)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    return n * 60 if unit == "h" else n
 
 def _format_recent_context(rows: list[tuple[str, str, str]], max_chars: int, max_line_chars: int) -> str:
     """
@@ -1188,6 +1290,29 @@ def _extract_json_array(text: str) -> list[dict]:
 
     return []
 
+def _is_valid_topic_id(t: str) -> bool:
+    return bool(re.match(r"^[a-z0-9_]{3,24}$", t or ""))
+
+def _extract_json_array(text: str) -> list[dict]:
+    if not text:
+        return []
+    text = text.strip()
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, list) else []
+    except Exception:
+        pass
+
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        blob = text[start:end+1]
+        try:
+            data = json.loads(blob)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+    return []
 
 
 async def _suggest_topic_id(text: str, candidates: list[str]) -> tuple[str | None, float]:
@@ -1888,6 +2013,14 @@ async def cmd_mine(ctx, *args):
       !mine <channel_id> <limit>
       !mine <#channel> <limit>
 
+    Optional time-based mode: "hot" / "15m" / "2h" (min 5 min, max 4 hours)
+
+    Example:
+      !mine hot
+      !mine 45m
+      !mine <#channel> hot
+      !mine <#channel> 2h
+
     Notes:
       - Runs from any channel, but will only mine channels in ALLOWED_CHANNEL_IDS.
       - Stores mined items as memory_events via remember_event().
@@ -1931,13 +2064,35 @@ async def cmd_mine(ctx, *args):
     if ch_obj is not None:
         target_channel_name = getattr(ch_obj, "name", None) or str(ch_obj)
 
-    # Fetch window from DB
-    async with db_lock:
-        rows = await asyncio.to_thread(_fetch_latest_messages_sync, db_conn, target_channel_id, limit)
+    # Optional time-based mode: "hot" / "15m" / "2h"
+    hot_minutes = None
+    for a in args:
+        hm = _parse_duration_to_minutes(str(a))
+        if hm is not None:
+            hot_minutes = max(5, min(240, hm))  # clamp 5m..4h
+            break
+
+    if hot_minutes is not None:
+        since_dt = discord.utils.utcnow() - datetime.timedelta(minutes=hot_minutes)
+        since_iso = since_dt.isoformat()
+        async with db_lock:
+            rows = await asyncio.to_thread(
+                _fetch_messages_since_sync,
+                db_conn,
+                target_channel_id,
+                since_iso,
+                500,  # cap so hot can't explode
+            )
+        mode_label = f"hot({hot_minutes}m)"
+    else:
+        async with db_lock:
+            rows = await asyncio.to_thread(_fetch_latest_messages_sync, db_conn, target_channel_id, limit)
+        mode_label = f"last({limit})"
 
     if not rows:
         await ctx.send("No messages found to mine for that channel.")
         return
+
 
     # Convert to chronological text block (oldest -> newest)
     # Use your existing formatter to keep consistent line shapes.
@@ -2051,7 +2206,7 @@ Rules:
         topic_summary = "(none)"
 
     await ctx.send(
-        f"🧴⛏️ Mined {len(rows)} msgs from <#{target_channel_id}> → saved {saved} memories. Topics: {topic_summary}"
+        f"🧴⛏️ Mined {len(rows)} msgs ({mode_label}) from <#{target_channel_id}> → saved {saved} memories. Topics: {topic_summary}"
     )
 
 @bot.command(name="ctxpeek")
@@ -2065,6 +2220,199 @@ async def ctxpeek(ctx: commands.Context, n: int = 10):
         rows = await asyncio.to_thread(_fetch_recent_context_sync, db_conn, ctx.channel.id, before, n)
     txt = _format_recent_context(rows, 1900, MAX_LINE_CHARS)
     await ctx.send(f"Recent context ({len(rows)} rows):\n{txt}")
+
+@bot.command(name="topicsuggest")
+async def cmd_topicsuggest(ctx, *args):
+    """
+    Suggest new topic_ids to add to the allowlist based on:
+      - recent channel messages (default), or
+      - existing saved memory events (mem mode)
+
+    Usage:
+      !topicsuggest
+      !topicsuggest hot
+      !topicsuggest 45m
+      !topicsuggest <#channel> hot
+      !topicsuggest <#channel> 200
+
+      !topicsuggest mem
+      !topicsuggest mem hot
+      !topicsuggest mem 2h
+    """
+    if ctx.channel.id not in ALLOWED_CHANNEL_IDS:
+        await ctx.send("This command isn't enabled in this channel.")
+        return
+
+    # Mode: messages (default) vs memories
+    mode = "messages"
+    for a in args:
+        if str(a).strip().lower() in {"mem", "memory", "memories"}:
+            mode = "memories"
+            break
+
+    target_channel_id = ctx.channel.id
+    limit = 250
+
+    # Parse args: channel + (hot duration OR limit)
+    if len(args) >= 1:
+        maybe_ch = _parse_channel_id_token(str(args[0]))
+        if maybe_ch:
+            target_channel_id = maybe_ch
+            if len(args) >= 2 and str(args[1]).isdigit():
+                limit = max(50, min(500, int(args[1])))
+        elif str(args[0]).isdigit():
+            limit = max(50, min(500, int(args[0])))
+
+    if target_channel_id not in ALLOWED_CHANNEL_IDS:
+        await ctx.send("That channel is not in Epoxy's allowlist, so I won't analyze it.")
+        return
+
+    # duration?
+    hot_minutes = None
+    for a in args:
+        hm = _parse_duration_to_minutes(str(a))
+        if hm is not None:
+            hot_minutes = max(5, min(240, hm))
+            break
+
+    # Resolve channel name (best effort)
+    target_channel_name = None
+    ch_obj = bot.get_channel(target_channel_id)
+    if ch_obj is None:
+        try:
+            ch_obj = await bot.fetch_channel(target_channel_id)
+        except Exception:
+            ch_obj = None
+    if ch_obj is not None:
+        target_channel_name = getattr(ch_obj, "name", None) or str(ch_obj)
+
+    # Fetch window (messages vs memories)
+    if mode == "memories":
+        if hot_minutes is not None:
+            since_dt = discord.utils.utcnow() - datetime.timedelta(minutes=hot_minutes)
+            since_iso = since_dt.isoformat()
+            async with db_lock:
+                mem_rows = await asyncio.to_thread(_fetch_memory_events_since_sync, db_conn, since_iso, 400)
+            mode_label = f"mem_hot({hot_minutes}m)"
+        else:
+            async with db_lock:
+                mem_rows = await asyncio.to_thread(_fetch_latest_memory_events_sync, db_conn, 300)
+            mode_label = "mem_last(300)"
+
+        if not mem_rows:
+            await ctx.send("No memory events found to analyze.")
+            return
+
+        window_text = _format_memory_events_window(mem_rows, max_chars=12000)
+        source_label = "MEMORY EVENTS (already curated)"
+
+    else:
+        if hot_minutes is not None:
+            since_dt = discord.utils.utcnow() - datetime.timedelta(minutes=hot_minutes)
+            since_iso = since_dt.isoformat()
+            async with db_lock:
+                rows = await asyncio.to_thread(_fetch_messages_since_sync, db_conn, target_channel_id, since_iso, 500)
+            mode_label = f"msg_hot({hot_minutes}m)"
+        else:
+            async with db_lock:
+                rows = await asyncio.to_thread(_fetch_latest_messages_sync, db_conn, target_channel_id, limit)
+            mode_label = f"msg_last({limit})"
+
+        if not rows:
+            await ctx.send("No messages found to analyze.")
+            return
+
+        window_text = _format_recent_context(rows, max_chars=12000, max_line_chars=450)
+        source_label = "RAW MESSAGES (chat log)"
+
+    existing = set(TOPIC_ALLOWLIST or [])
+    existing_str = ", ".join(sorted(existing)) if existing else "(none)"
+
+    prompt = f"""
+You are Epoxy's topic curator.
+
+Goal: propose NEW topic_ids to add to an allowlist for memory organization.
+You will be given either Discord message logs or memory event entries.
+
+Return a JSON ARRAY ONLY (no markdown, no commentary), with 0-10 items.
+Each item must have EXACT keys:
+- "topic_id": snake_case string, 3-24 chars, [a-z0-9_], must NOT already exist
+- "label": short human label
+- "why": 1 sentence why this topic is distinct/useful
+- "examples": array of 2-3 short phrases quoted/paraphrased from the window (no invention)
+- "confidence": number 0.0-1.0
+
+Hard rules:
+- Do NOT propose any topic_id that is already in: [{existing_str}]
+- Do NOT invent themes not supported by the window.
+- Avoid overly broad topics ("general", "random", "chat").
+- Prefer stable recurring categories that would matter for weeks/months.
+""".strip()
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": prompt[:1900]},
+                {"role": "user", "content": (
+                    f"Source: {source_label}\n"
+                    f"Channel: {target_channel_name or target_channel_id}\n"
+                    f"Window:\n{window_text}"
+                )[:12000]},
+            ],
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        await ctx.send(f"topicsuggest failed (LLM error): {e}")
+        return
+
+    items = _extract_json_array(raw)
+
+    # Validate / filter
+    out = []
+    for it in items:
+        tid = (it.get("topic_id") or "").strip().lower()
+        if not _is_valid_topic_id(tid):
+            continue
+        if tid in existing:
+            continue
+        conf = float(it.get("confidence", 0.0) or 0.0)
+        if conf < 0.55:
+            continue
+        out.append({
+            "topic_id": tid,
+            "label": (it.get("label") or "").strip()[:60],
+            "why": (it.get("why") or "").strip()[:180],
+            "examples": [str(x).strip()[:80] for x in (it.get("examples") or [])][:3],
+            "confidence": conf,
+        })
+
+    # Deduplicate by topic_id
+    seen = set()
+    final = []
+    for it in out:
+        if it["topic_id"] in seen:
+            continue
+        seen.add(it["topic_id"])
+        final.append(it)
+
+    # Reply
+    if not final:
+        await ctx.send(f"🧴🗂️ Topic suggestions: none (mode={mode_label} in <#{target_channel_id}>)")
+        return
+
+    # Human summary + JSON payload for copy/paste
+    summary_lines = [f"🧴🗂️ Topic suggestions (mode={mode_label} in <#{target_channel_id}>):"]
+    for it in final[:10]:
+        ex = "; ".join(it["examples"][:2])
+        summary_lines.append(f"- `{it['topic_id']}` ({it['confidence']:.2f}): {it['why']}  e.g. {ex}")
+
+    json_blob = json.dumps(final[:10], indent=2)
+
+    msg = "\n".join(summary_lines)
+    await send_chunked(ctx.channel, msg[:1900])
+    await send_chunked(ctx.channel, f"```json\n{json_blob}\n```")
+
 
 
 # Backfill config
