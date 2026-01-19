@@ -988,8 +988,14 @@ def _format_recent_context(rows: list[tuple[str, str, str]], max_chars: int, max
 
     for created_at_utc, author_name, content in rows:
         clean = " ".join((content or "").split())  # collapse whitespace/newlines
+
         if len(clean) > max_line_chars:
-            clean = clean[: max_line_chars - 1] + "…"
+            # Preserve both head + tail so we keep the "what" and the "so what"
+            head_len = int(max_line_chars * 0.65)
+            tail_len = max_line_chars - head_len - 3
+            head = clean[:head_len].rstrip()
+            tail = clean[-tail_len:].lstrip() if tail_len > 0 else ""
+            clean = f"{head}…{tail}"
 
         # Keep timestamp compact (ISO -> just time if present)
         ts = created_at_utc
@@ -2067,7 +2073,7 @@ BACKFILL_PAUSE_EVERY = 200
 BACKFILL_PAUSE_SECONDS = 0.25
 RECENT_CONTEXT_LIMIT = int(os.getenv("EPOXY_RECENT_CONTEXT_LIMIT", "40"))
 RECENT_CONTEXT_MAX_CHARS = int(os.getenv("EPOXY_RECENT_CONTEXT_CHARS", "6000"))
-MAX_LINE_CHARS = int(os.getenv("EPOXY_RECENT_CONTEXT_LINE_CHARS", "300"))
+MAX_LINE_CHARS = int(os.getenv("EPOXY_RECENT_CONTEXT_LINE_CHARS", "600"))
 
 async def backfill_channel(channel: discord.abc.Messageable) -> None:
     if not hasattr(channel, "id"):
@@ -2204,7 +2210,9 @@ async def on_message(message: discord.Message):
             )
 
             context_pack = build_context_pack()[:MAX_MSG_CONTENT]
-            recent_context = recent_context[:MAX_MSG_CONTENT]
+            if len(recent_context) > MAX_MSG_CONTENT:
+                recent_context = recent_context[-MAX_MSG_CONTENT:]
+
             safe_prompt = prompt[:MAX_MSG_CONTENT]
 
             memory_pack = ""
@@ -2240,6 +2248,7 @@ async def on_message(message: discord.Message):
                 # Small continuity hint: prefer the most recent subject in Epoxy's last message
                 {"role": "system", "content": "Continuity: treat the subject of Epoxy's most recent message in the recent context as the default referent for follow-up questions unless the user clearly changes subject."[:MAX_MSG_CONTENT]},
                 {"role": "system", "content": f"Recent channel context:\n{recent_context}"[:MAX_MSG_CONTENT]},
+                {"role": "system", "content": "When a user says 'yes/please' to a suggestion or offer in the recent context, treat it as accepting the most recent offer/question from Epoxy and respond to that specific offer using details from the same message."[:MAX_MSG_CONTENT]},
             ]
 
             if stage_at_least("M1") and memory_pack:
