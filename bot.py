@@ -954,6 +954,24 @@ def _format_memory_events_window(rows: list[tuple[str, str, str, str]], max_char
         total += len(line) + 1
     return "\n".join(out_lines)
 
+def _fetch_last_messages_by_author_sync(conn, channel_id, before_message_id, author_name_like, limit=1):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT created_at_utc, author_name, content
+        FROM messages
+        WHERE channel_id = ?
+          AND message_id < ?
+          AND author_name LIKE ?
+          AND content IS NOT NULL
+          AND TRIM(content) != ''
+        ORDER BY message_id DESC
+        LIMIT ?
+        """,
+        (channel_id, before_message_id, author_name_like, limit),
+    )
+    return cur.fetchall()
+
 
 def _get_backfill_done_sync(conn: sqlite3.Connection, channel_id: int) -> tuple[bool, str | None]:
     cur = conn.cursor()
@@ -2555,6 +2573,11 @@ async def on_message(message: discord.Message):
     # Optional auto-capture of high-signal items into persistent memory
     await maybe_auto_capture(message)
 
+    # Let command processing happen (so !mine/!topicsuggest etc work even without @mention)
+    if (message.content or "").lstrip().startswith("!"):
+        await bot.process_commands(message)
+        return
+
     # Only respond if mentioned
     if bot.user and bot.user in message.mentions:
         # Strip both <@id> and <@!id>
@@ -2568,21 +2591,72 @@ async def on_message(message: discord.Message):
         try:
             MAX_MSG_CONTENT = 1900
 
-            recent_context, ctx_rows = await get_recent_channel_context(
-                message.channel.id, message.id
-            )
+            # --- Recent context ---
+            recent_context, ctx_rows = await get_recent_channel_context(message.channel.id, message.id)
 
-            context_pack = build_context_pack()[:MAX_MSG_CONTENT]
+            # Keep the most-recent tail of context if it exceeds budget
             if len(recent_context) > MAX_MSG_CONTENT:
                 recent_context = recent_context[-MAX_MSG_CONTENT:]
 
+            # --- Reply anchors (interleaving-safe continuity) ---
+            # These let the model bind short replies ("yes", "fun vibe") to the correct last Epoxy question
+            anchor_block = ""
+            async with db_lock:
+                # last Epoxy line before this message
+                bot_rows = await asyncio.to_thread(
+                    _fetch_last_messages_by_author_sync,
+                    db_conn,
+                    message.channel.id,
+                    message.id,
+                    "%Epoxy%",  # adjust if your bot author_name format differs
+                    1,
+                )
+                # last line from same user before this message
+                # Use author_id if you have it; name matching is a best-effort fallback.
+                user_rows = await asyncio.to_thread(
+                    _fetch_last_messages_by_author_sync,
+                    db_conn,
+                    message.channel.id,
+                    message.id,
+                    f"%{message.author.name}%",
+                    1,
+                )
+
+            def _fmt_anchor(rows, label: str) -> str:
+                if not rows:
+                    return ""
+                ts, who, txt = rows[0]
+                clean = " ".join((txt or "").split())
+                if len(clean) > 420:
+                    clean = clean[:419] + "…"
+                return f"{label}: [{ts}] {who}: {clean}"
+
+            parts = []
+            b = _fmt_anchor(bot_rows, "LAST EPOXY MESSAGE")
+            u = _fmt_anchor(user_rows, "LAST MESSAGE FROM THIS USER")
+            if b:
+                parts.append(b)
+            if u:
+                parts.append(u)
+            if parts:
+                anchor_block = (
+                    "Reply anchors (use these to interpret short replies like 'yes', 'fun vibe', 'agree'):\n"
+                    + "\n".join(parts)
+                )
+                if len(anchor_block) > MAX_MSG_CONTENT:
+                    anchor_block = anchor_block[-MAX_MSG_CONTENT:]
+
+            # --- Packs / prompt ---
+            context_pack = build_context_pack()[:MAX_MSG_CONTENT]
             safe_prompt = prompt[:MAX_MSG_CONTENT]
 
             memory_pack = ""
             if stage_at_least("M1"):
                 scope = infer_scope(safe_prompt) if stage_at_least("M2") else "auto"
                 events, summaries = await recall_memory(safe_prompt, scope=scope)
-                memory_pack = format_memory_for_llm(events, summaries, max_chars=MAX_MSG_CONTENT)[:MAX_MSG_CONTENT]
+                memory_pack = format_memory_for_llm(events, summaries, max_chars=MAX_MSG_CONTENT)
+                if len(memory_pack) > MAX_MSG_CONTENT:
+                    memory_pack = memory_pack[:MAX_MSG_CONTENT]  # keep head: most relevant first
 
             print(
                 f"[CTX] channel={message.channel.id} rows={ctx_rows} before={message.id} "
@@ -2598,6 +2672,8 @@ async def on_message(message: discord.Message):
                 "Do not rely on general knowledge.\n"
                 "CRITICAL ATTRIBUTION RULE: Do NOT invent metadata (channel name, user, date, message id, source). "
                 "If a detail is not explicitly present, label it as unknown.\n"
+                "CORESPONSE/CONTINUITY RULE: If the user reply is short (<= 6 words), interpret it as an answer to "
+                "Epoxy's most recent direct question/offer in the recent context unless the user clearly starts a new task.\n"
                 "COREFERENCE RULE: If the user uses a pronoun (he/she/they/it/that) and the recent channel context "
                 "clearly names a single likely referent in the last 1–3 turns, assume that referent. "
                 "Ask a clarifying question ONLY if there are 2+ plausible referents in the last 3 turns.\n"
@@ -2608,11 +2684,15 @@ async def on_message(message: discord.Message):
                 {"role": "system", "content": SYSTEM_PROMPT_BASE[:MAX_MSG_CONTENT]},
                 {"role": "system", "content": context_pack},
                 {"role": "system", "content": INSTRUCTIONS},
-                # Small continuity hint: prefer the most recent subject in Epoxy's last message
-                {"role": "system", "content": "Continuity: treat the subject of Epoxy's most recent message in the recent context as the default referent for follow-up questions unless the user clearly changes subject."[:MAX_MSG_CONTENT]},
-                {"role": "system", "content": f"Recent channel context:\n{recent_context}"[:MAX_MSG_CONTENT]},
-                {"role": "system", "content": "When a user says 'yes/please' to a suggestion or offer in the recent context, treat it as accepting the most recent offer/question from Epoxy and respond to that specific offer using details from the same message."[:MAX_MSG_CONTENT]},
             ]
+
+            # Insert anchors BEFORE the recent context so the model treats them as routing hints
+            if anchor_block:
+                chat_messages.append({"role": "system", "content": anchor_block[:MAX_MSG_CONTENT]})
+
+            chat_messages.append(
+                {"role": "system", "content": f"Recent channel context:\n{recent_context}"[:MAX_MSG_CONTENT]}
+            )
 
             if stage_at_least("M1") and memory_pack:
                 chat_messages.append(
@@ -2630,6 +2710,7 @@ async def on_message(message: discord.Message):
             await message.channel.send("Epoxy hiccuped. Check logs 🧴⚙️")
 
     await bot.process_commands(message)
+
 
 
 bot.run(DISCORD_TOKEN)
