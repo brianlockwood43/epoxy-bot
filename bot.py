@@ -66,7 +66,7 @@ try:
 except ValueError:
     TOPIC_MIN_CONF = 0.85
 
-RESERVED_KIND_TAGS = {"decision", "policy", "canon", "profile"}
+RESERVED_KIND_TAGS = {"decision", "policy", "canon", "profile", "protocol"}
 
 _DEFAULT_TOPIC_ALLOWLIST = (
     "ops,announcements,community,coaches,workshops,league,one_on_one,"
