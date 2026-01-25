@@ -4,10 +4,15 @@ import asyncio
 import json
 import re
 import time
-from datetime import datetime, timezone
+import hashlib
+from datetime import datetime, timezone, timedelta
 import discord
 from discord.ext import commands
 from openai import OpenAI
+
+
+# current bugs: <!mine hot> throws an error on the timedelta. maybe need a default time or make sure it's wired to a specific number of messages
+
 
 # =========================
 # ENV
@@ -30,6 +35,10 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 #   M1: persistent event memory + recall
 #   M2: temporal tiers (hot/warm/cold) + tier-aware recall/cleanup
 #   M3: summaries (topic gists) + optional consolidation jobs
+#   M4: manual meta-memories/narrative and role arcs
+#   M5: semi-automatic human-in-loop memories being connected to manual meta-memories/narratives and roles
+#   M6: semi-automatic human-in-loop self suggestion of meta-memories/narratives and roles connected to memories
+#   M7: fully autonomous creation and management of memories and meta-memories/narratives+roles
 #
 # Control via env:
 #   EPOXY_MEMORY_STAGE = M0 | M1 | M2 | M3   (default: M0)
@@ -242,6 +251,21 @@ async def send_chunked(channel: discord.abc.Messageable, text: str) -> None:
     for part in chunk_text(text, DISCORD_MAX_MESSAGE_LEN):
         await channel.send(part)
 
+def _safe_table_info(cur, table: str):
+    try:
+        cur.execute(f"PRAGMA table_info({table})")
+        rows = cur.fetchall()
+        # rows: (cid, name, type, notnull, dflt_value, pk)
+        cols = [r[1] for r in rows]
+        return cols
+    except Exception as e:
+        return [f"<error: {e}>"]
+
+def _schema_has_columns(cur, table: str, required: list[str]) -> tuple[bool, list[str]]:
+    cols = set(_safe_table_info(cur, table))
+    missing = [c for c in required if c not in cols]
+    return (len(missing) == 0, missing)
+
 # =========================
 # SQLITE
 # =========================
@@ -283,25 +307,58 @@ def init_db(db_path: str) -> sqlite3.Connection:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_author_id ON messages(author_id)")
 
 
-    # Persistent memory events (M1+)
+    # Persistent memory events (M1+), upgraded for M3 parity
     cur.execute("""
     CREATE TABLE IF NOT EXISTS memory_events (
-        id                INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at_utc     TEXT,
-        created_ts         INTEGER,
-        guild_id           INTEGER,
-        channel_id         INTEGER,
-        channel_name       TEXT,
-        author_id          INTEGER,
-        author_name        TEXT,
-        source_message_id  INTEGER,
-        text               TEXT NOT NULL,
-        tags_json          TEXT,
-        importance         INTEGER DEFAULT 0,
-        tier               INTEGER DEFAULT 1,
-        summarized         INTEGER DEFAULT 0
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        -- core timestamps
+        created_at_utc          TEXT,
+        created_ts              INTEGER,
+        updated_at_utc          TEXT,
+        last_verified_at_utc    TEXT,
+        expiry_at_utc           TEXT,
+
+        -- scope/provenance
+        scope                  TEXT DEFAULT NULL,     -- e.g. global | project:X | thread:Y | channel:<id>
+        guild_id               INTEGER,
+        channel_id             INTEGER,
+        channel_name           TEXT,
+        author_id              INTEGER,
+        author_name            TEXT,
+        source_message_id      INTEGER,
+
+        -- "logged from" provenance (already used by you)
+        logged_from_channel_id     INTEGER,
+        logged_from_channel_name   TEXT,
+        logged_from_message_id     INTEGER,
+        source_channel_id          INTEGER,
+        source_channel_name        TEXT,
+
+        -- content + tags
+        type                   TEXT DEFAULT 'event',  -- event|preference|concept|relationship|policy|instruction|skill|artifact_ref|note
+        title                  TEXT DEFAULT NULL,
+        text                   TEXT NOT NULL,
+        tags_json              TEXT,
+
+        -- quality + lifecycle
+        confidence             REAL DEFAULT 0.6,
+        stability              TEXT DEFAULT 'medium', -- volatile|medium|stable
+        lifecycle              TEXT DEFAULT 'active', -- candidate|active|archived|deprecated|deleted
+        superseded_by          INTEGER DEFAULT NULL,
+
+        -- your existing controls
+        importance             INTEGER DEFAULT 0,
+        tier                   INTEGER DEFAULT 1,
+        summarized             INTEGER DEFAULT 0,
+
+        -- topic suggestion (already in your migrations; included here for fresh DBs)
+        topic_id               TEXT,
+        topic_source           TEXT DEFAULT 'manual',
+        topic_confidence       REAL
     )
     """)
+
 
     # M3.5 topic suggestion columns (safe migrations for existing DBs)
     for stmt in [
@@ -326,21 +383,157 @@ def init_db(db_path: str) -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass
 
+    # =========================
+    # M3 parity migrations (safe for existing DBs)
+    # =========================
+    for stmt in [
+        # memory_events upgrades
+        "ALTER TABLE memory_events ADD COLUMN updated_at_utc TEXT",
+        "ALTER TABLE memory_events ADD COLUMN last_verified_at_utc TEXT",
+        "ALTER TABLE memory_events ADD COLUMN expiry_at_utc TEXT",
 
-    # Topic summaries (M3)
+        "ALTER TABLE memory_events ADD COLUMN scope TEXT",
+        "ALTER TABLE memory_events ADD COLUMN type TEXT DEFAULT 'event'",
+        "ALTER TABLE memory_events ADD COLUMN title TEXT",
+        "ALTER TABLE memory_events ADD COLUMN confidence REAL DEFAULT 0.6",
+        "ALTER TABLE memory_events ADD COLUMN stability TEXT DEFAULT 'medium'",
+        "ALTER TABLE memory_events ADD COLUMN lifecycle TEXT DEFAULT 'active'",
+        "ALTER TABLE memory_events ADD COLUMN superseded_by INTEGER",
+
+        # memory_summaries upgrades
+        "ALTER TABLE memory_summaries ADD COLUMN summary_type TEXT DEFAULT 'topic_gist'",
+        "ALTER TABLE memory_summaries ADD COLUMN scope TEXT",
+        "ALTER TABLE memory_summaries ADD COLUMN covers_event_ids_json TEXT DEFAULT '[]'",
+        "ALTER TABLE memory_summaries ADD COLUMN confidence REAL DEFAULT 0.6",
+        "ALTER TABLE memory_summaries ADD COLUMN stability TEXT DEFAULT 'medium'",
+        "ALTER TABLE memory_summaries ADD COLUMN last_verified_at_utc TEXT",
+        "ALTER TABLE memory_summaries ADD COLUMN lifecycle TEXT DEFAULT 'active'",
+        "ALTER TABLE memory_summaries ADD COLUMN tier INTEGER DEFAULT 2",
+        "ALTER TABLE memory_summaries ADD COLUMN generated_by_model TEXT",
+        "ALTER TABLE memory_summaries ADD COLUMN prompt_hash TEXT",
+        "ALTER TABLE memory_summaries ADD COLUMN job_id TEXT",
+    ]:
+        try:
+            cur.execute(stmt)
+        except sqlite3.OperationalError:
+            pass
+
+    # -------------------------
+    # Backfills (best-effort)
+    # -------------------------
+    # 1) updated_at_utc / last_verified_at_utc defaults
+    try:
+        cur.execute("UPDATE memory_events SET updated_at_utc = created_at_utc WHERE updated_at_utc IS NULL AND created_at_utc IS NOT NULL")
+        cur.execute("UPDATE memory_events SET last_verified_at_utc = created_at_utc WHERE last_verified_at_utc IS NULL AND created_at_utc IS NOT NULL")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cur.execute("UPDATE memory_summaries SET last_verified_at_utc = updated_at_utc WHERE last_verified_at_utc IS NULL AND updated_at_utc IS NOT NULL")
+        cur.execute("UPDATE memory_summaries SET summary_type = 'topic_gist' WHERE summary_type IS NULL OR summary_type = ''")
+    except sqlite3.OperationalError:
+        pass
+
+    # 2) scope defaults: keep it simple and deterministic
+    #    - if channel_id exists, scope = channel:<id>, else guild:<id>, else global
+    try:
+        cur.execute("""
+            UPDATE memory_events
+            SET scope =
+                CASE
+                    WHEN channel_id IS NOT NULL THEN 'channel:' || channel_id
+                    WHEN guild_id IS NOT NULL THEN 'guild:' || guild_id
+                    ELSE 'global'
+                END
+            WHERE scope IS NULL OR scope = ''
+        """)
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cur.execute("""
+            UPDATE memory_summaries
+            SET scope =
+                CASE
+                    WHEN topic_id IS NOT NULL AND topic_id != '' THEN 'topic:' || topic_id
+                    ELSE 'global'
+                END
+            WHERE scope IS NULL OR scope = ''
+        """)
+    except sqlite3.OperationalError:
+        pass
+
+    # 3) type inference from tags (conservative, only sets if currently default/blank)
+    #    Adjust mapping later; this is just to avoid everything being "event".
+    try:
+        cur.execute("""
+            UPDATE memory_events
+            SET type =
+                CASE
+                    WHEN tags_json LIKE '%"policy"%' THEN 'policy'
+                    WHEN tags_json LIKE '%"protocol"%' THEN 'instruction'
+                    WHEN tags_json LIKE '%"profile"%' THEN 'preference'
+                    WHEN tags_json LIKE '%"decision"%' THEN 'event'
+                    WHEN tags_json LIKE '%"canon"%' THEN 'concept'
+                    ELSE 'event'
+                END
+            WHERE (type IS NULL OR type = '' OR type = 'event')
+              AND tags_json IS NOT NULL AND tags_json != ''
+        """)
+    except sqlite3.OperationalError:
+        pass
+
+    # -------------------------
+    # Indexes for new fields
+    # -------------------------
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_events_scope ON memory_events(scope)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_events_type ON memory_events(type)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_events_lifecycle ON memory_events(lifecycle)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_events_last_verified ON memory_events(last_verified_at_utc)")
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_summaries_type ON memory_summaries(summary_type)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_summaries_scope ON memory_summaries(scope)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_summaries_lifecycle ON memory_summaries(lifecycle)")
+
+    # Summaries (M3), upgraded for auditability + multiple summary types
     cur.execute("""
     CREATE TABLE IF NOT EXISTS memory_summaries (
-        id               INTEGER PRIMARY KEY AUTOINCREMENT,
-        topic_id         TEXT NOT NULL,
-        created_at_utc   TEXT,
-        updated_at_utc   TEXT,
-        start_ts         INTEGER,
-        end_ts           INTEGER,
-        tags_json        TEXT,
-        importance       INTEGER DEFAULT 1,
-        summary_text     TEXT NOT NULL
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        -- what kind of summary this is
+        summary_type           TEXT DEFAULT 'topic_gist',  -- event_digest|topic_gist|decision_log|preference_profile
+        scope                  TEXT DEFAULT NULL,         -- same scheme as memory_events.scope
+
+        -- legacy support: topic gists still keyed by topic_id
+        topic_id               TEXT,
+
+        -- time bounds and metadata
+        created_at_utc          TEXT,
+        updated_at_utc          TEXT,
+        start_ts                INTEGER,
+        end_ts                  INTEGER,
+
+        tags_json              TEXT,
+        importance             INTEGER DEFAULT 1,
+
+        -- content
+        summary_text           TEXT NOT NULL,
+
+        -- audit + governance
+        covers_event_ids_json  TEXT DEFAULT '[]',
+        confidence             REAL DEFAULT 0.6,
+        stability              TEXT DEFAULT 'medium',
+        last_verified_at_utc   TEXT,
+        lifecycle              TEXT DEFAULT 'active',
+        tier                   INTEGER DEFAULT 2,
+
+        -- generation metadata
+        generated_by_model     TEXT,
+        prompt_hash            TEXT,
+        job_id                 TEXT
     )
     """)
+
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_events_created_ts ON memory_events(created_ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_events_tier ON memory_events(tier)")
@@ -358,6 +551,30 @@ def init_db(db_path: str) -> sqlite3.Connection:
     CREATE VIRTUAL TABLE IF NOT EXISTS memory_summaries_fts
     USING fts5(topic_id, summary_text, tags, tokenize='unicode61')
     """)
+
+    # ---- Schema verification (logs show up in Railway) ----
+    try:
+        required_events = [
+            "updated_at_utc", "last_verified_at_utc", "expiry_at_utc",
+            "scope", "type", "title", "confidence", "stability", "lifecycle", "superseded_by",
+        ]
+        required_summaries = [
+            "summary_type", "scope", "covers_event_ids_json",
+            "confidence", "stability", "last_verified_at_utc",
+            "lifecycle", "tier", "generated_by_model", "prompt_hash", "job_id",
+        ]
+
+        ok_e, missing_e = _schema_has_columns(cur, "memory_events", required_events)
+        ok_s, missing_s = _schema_has_columns(cur, "memory_summaries", required_summaries)
+
+        print(f"[DB] memory_events schema OK={ok_e} missing={missing_e}")
+        print(f"[DB] memory_summaries schema OK={ok_s} missing={missing_s}")
+
+        # Optional: dump the full column lists once (useful early on)
+        print(f"[DB] memory_events cols: {_safe_table_info(cur, 'memory_events')}")
+        print(f"[DB] memory_summaries cols: {_safe_table_info(cur, 'memory_summaries')}")
+    except Exception as e:
+        print(f"[DB] Schema verification failed: {e}")
 
     conn.commit()
     return conn
@@ -443,6 +660,43 @@ def infer_scope(prompt: str) -> str:
         return "cold"
     return "auto"
 
+def parse_recall_scope(scope: str | None) -> tuple[str, int | None, int | None]:
+    """
+    Parse a recall scope string.
+
+    Supported tokens (space- or comma-separated):
+      - temporal: hot | warm | cold | auto
+      - filters:  channel:<id> | guild:<id>
+
+    Returns: (temporal_scope, guild_id, channel_id)
+    """
+    scope = (scope or "auto").strip().lower()
+    if not scope:
+        return ("auto", None, None)
+
+    tokens = re.split(r"[\s,]+", scope)
+    temporal = "auto"
+    guild_id: int | None = None
+    channel_id: int | None = None
+
+    for tok in tokens:
+        if tok in ("hot", "warm", "cold", "auto"):
+            temporal = tok
+            continue
+        if tok.startswith("channel:"):
+            try:
+                channel_id = int(tok.split(":", 1)[1])
+            except ValueError:
+                channel_id = None
+            continue
+        if tok.startswith("guild:"):
+            try:
+                guild_id = int(tok.split(":", 1)[1])
+            except ValueError:
+                guild_id = None
+            continue
+
+    return (temporal, guild_id, channel_id)
 
 def _insert_message_sync(conn: sqlite3.Connection, payload: dict) -> None:
     cur = conn.cursor()
@@ -627,15 +881,17 @@ def _search_memory_events_sync(conn: sqlite3.Connection, query: str, scope: str,
     if not fts_q:
         return []
 
-    scope = (scope or "auto").lower()
-    if scope == "hot":
+    temporal_scope, guild_id, channel_id = parse_recall_scope(scope)
+
+    if temporal_scope == "hot":
         allowed_tiers = (0,)
-    elif scope == "warm":
+    elif temporal_scope == "warm":
         allowed_tiers = (0, 1)
-    elif scope == "cold":
+    elif temporal_scope == "cold":
         allowed_tiers = (2,)
     else:
         allowed_tiers = (0, 1, 2, 3)
+
 
     cur = conn.cursor()
 
@@ -659,10 +915,13 @@ def _search_memory_events_sync(conn: sqlite3.Connection, query: str, scope: str,
         FROM memory_events_fts
         JOIN memory_events me ON me.id = memory_events_fts.rowid
         WHERE memory_events_fts MATCH ?
-          AND me.tier IN ({tier_placeholders})
+        AND me.tier IN ({tier_placeholders})
+        AND (? IS NULL OR me.channel_id = ?)
+        AND (? IS NULL OR me.guild_id = ?)
         LIMIT 60
+
         """,
-        (fts_q, *allowed_tiers),
+        (fts_q, *allowed_tiers, channel_id, channel_id, guild_id, guild_id),
     )
     rows = cur.fetchall()
 
@@ -1515,12 +1774,119 @@ async def remember_event(
         "tags": tags,
     }
 
+def _budget_and_diversify_events(events: list[dict], scope: str, limit: int = 8) -> list[dict]:
+    """
+    Apply simple budgets to reduce near-duplicates and keep a healthy mix.
+
+    Deterministic (stable for a given input ordering) so you can test retrieval behavior.
+    Enforces tier budgets (hot/warm/cold) in M2+ to prevent cold-memory bleed.
+    """
+    if not events or int(limit or 0) <= 0:
+        return []
+
+    limit = int(limit)
+
+    # Heuristics: keep variety across topic/channel/author while preserving relevance ordering.
+    topic_cap = 3
+    channel_cap = 4
+    author_cap = 3
+
+    # If the user explicitly scoped to a single channel or guild, don't waste budget on that axis.
+    # Accept both old ("channel:") and tokenized scopes ("hot channel:123").
+    s = (scope or "").strip().lower()
+    if ("channel:" in s) or ("guild:" in s):
+        channel_cap = limit
+
+    # Tier budgets (0=hot, 1=warm, 2=cold, 3=archive).
+    # Default tuned for limit=8 -> 4 hot / 3 warm / 1 cold.
+    def _tier_caps(n: int) -> dict[int, int]:
+        n = max(1, int(n))
+        if n <= 3:
+            return {0: n, 1: 0, 2: 0, 3: 0}
+
+        hot = max(1, int(round(n * 0.50)))
+        warm = max(0, int(round(n * 0.375)))
+        cold = max(0, n - hot - warm)
+
+        # Fix rounding drift deterministically.
+        while hot + warm + cold < n:
+            warm += 1
+        while hot + warm + cold > n:
+            if warm > 0:
+                warm -= 1
+            elif hot > 1:
+                hot -= 1
+            else:
+                cold = max(0, cold - 1)
+
+        return {0: hot, 1: warm, 2: cold, 3: 0}
+
+    caps = _tier_caps(limit) if stage_at_least("M2") else {0: limit, 1: limit, 2: limit, 3: limit}
+    tier_counts: dict[int, int] = {}
+
+    def _fp(e: dict) -> str:
+        # Events use "text"; keep fallback to "content" for older rows/paths.
+        txt = (e.get("text") or e.get("content") or "").strip().lower()
+        txt = re.sub(r"\s+", " ", txt)
+        return hashlib.sha1(txt.encode("utf-8")).hexdigest()
+
+    seen: set[str] = set()
+    topic_counts: dict[str, int] = {}
+    channel_counts: dict[str, int] = {}
+    author_counts: dict[str, int] = {}
+
+    out: list[dict] = []
+    for e in events:
+        tier = int(e.get("tier") if e.get("tier") is not None else 1)
+
+        # In M2+, archive is generally noise for recall unless you explicitly fetch it.
+        if stage_at_least("M2") and tier >= 3:
+            continue
+
+        # Enforce tier budget (only meaningful in M2+).
+        if stage_at_least("M2"):
+            if tier_counts.get(tier, 0) >= caps.get(tier, 0):
+                continue
+
+        fp = _fp(e)
+        if fp in seen:
+            continue
+        seen.add(fp)
+
+        t = (e.get("topic_id") or "").strip()
+        c = str(e.get("channel_id") or "")
+        a = str(e.get("author_id") or "")
+
+        if t and topic_counts.get(t, 0) >= topic_cap:
+            continue
+        if c and channel_counts.get(c, 0) >= channel_cap:
+            continue
+        if a and author_counts.get(a, 0) >= author_cap:
+            continue
+
+        out.append(e)
+
+        if stage_at_least("M2"):
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        if t:
+            topic_counts[t] = topic_counts.get(t, 0) + 1
+        if c:
+            channel_counts[c] = channel_counts.get(c, 0) + 1
+        if a:
+            author_counts[a] = author_counts.get(a, 0) + 1
+
+        if len(out) >= limit:
+            break
+
+    return out
+
 async def recall_memory(prompt: str, scope: str | None = None) -> tuple[list[dict], list[dict]]:
     if not stage_at_least("M1"):
         return ([], [])
     scope = (scope or ("auto" if stage_at_least("M2") else "auto"))
     async with db_lock:
-        events = await asyncio.to_thread(_search_memory_events_sync, db_conn, prompt, scope, 8)
+        events = await asyncio.to_thread(_search_memory_events_sync, db_conn, prompt, scope, 40)
+        events = _budget_and_diversify_events(events, scope, limit=8)
         summaries = []
         if stage_at_least("M3"):
             summaries = await asyncio.to_thread(_search_memory_summaries_sync, db_conn, prompt, 3)
@@ -1762,7 +2128,8 @@ async def log_message(message: discord.Message) -> None:
 
 async def is_backfill_done(channel_id: int) -> bool:
     async with db_lock:
-        return await asyncio.to_thread(_get_backfill_done_sync, db_conn, channel_id)
+        done, _last = await asyncio.to_thread(_get_backfill_done_sync, db_conn, channel_id)
+    return bool(done)
 
 async def mark_backfill_done(channel_id: int) -> None:
     iso_utc = discord.utils.utcnow().isoformat()
@@ -2091,7 +2458,7 @@ async def cmd_mine(ctx, *args):
             break
 
     if hot_minutes is not None:
-        since_dt = discord.utils.utcnow() - datetime.timedelta(minutes=hot_minutes)
+        since_dt = discord.utils.utcnow() - timedelta(minutes=hot_minutes)
         since_iso = since_dt.isoformat()
         async with db_lock:
             rows = await asyncio.to_thread(
@@ -2307,7 +2674,7 @@ async def cmd_topicsuggest(ctx, *args):
     # Fetch window (messages vs memories)
     if mode == "memories":
         if hot_minutes is not None:
-            since_dt = discord.utils.utcnow() - datetime.timedelta(minutes=hot_minutes)
+            since_dt = discord.utils.utcnow() - timedelta(minutes=hot_minutes)
             since_iso = since_dt.isoformat()
             async with db_lock:
                 mem_rows = await asyncio.to_thread(_fetch_memory_events_since_sync, db_conn, since_iso, 400)
@@ -2326,7 +2693,7 @@ async def cmd_topicsuggest(ctx, *args):
 
     else:
         if hot_minutes is not None:
-            since_dt = discord.utils.utcnow() - datetime.timedelta(minutes=hot_minutes)
+            since_dt = discord.utils.utcnow() - timedelta(minutes=hot_minutes)
             since_iso = since_dt.isoformat()
             async with db_lock:
                 rows = await asyncio.to_thread(_fetch_messages_since_sync, db_conn, target_channel_id, since_iso, 500)
