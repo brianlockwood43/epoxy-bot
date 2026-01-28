@@ -11,9 +11,6 @@ from discord.ext import commands
 from openai import OpenAI
 
 
-# current bugs: <!mine hot> throws an error on the timedelta. maybe need a default time or make sure it's wired to a specific number of messages
-
-
 # =========================
 # ENV
 # =========================
@@ -52,6 +49,14 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 # ---- Memory / staging config (drop-in) ----
 import os
 import re
+
+# IDs: right-click channel → Copy ID (with Developer Mode on)
+LFG_SOURCE_CHANNEL_ID     = 1465985366908600506  # #looking-for-group-pings
+LFG_PUBLIC_CHANNEL_ID     = 1465824527043919986  # #lfg (public)
+PADDOCK_LOUNGE_CHANNEL_ID = 1410966350196768809  # #paddock-lounge (members)
+
+LFG_ROLE_NAME   = "Driving Pings"    # opt-in ping role
+MEMBER_ROLE_KEYWORDS = ["Discovery", "Mastery"]
 
 # Stage gating (default conservative; set env to enable higher stages)
 MEMORY_STAGE = os.getenv("EPOXY_MEMORY_STAGE", "M0").strip().upper()
@@ -697,6 +702,10 @@ def parse_recall_scope(scope: str | None) -> tuple[str, int | None, int | None]:
             continue
 
     return (temporal, guild_id, channel_id)
+
+def user_has_any_role(member: discord.Member, role_names: list[str]) -> bool:
+    return any(role.name in role_names for role in member.roles)
+
 
 def _insert_message_sync(conn: sqlite3.Connection, payload: dict) -> None:
     cur = conn.cursor()
@@ -2813,6 +2822,72 @@ async def cmd_topicsuggest(ctx, *args):
     await send_chunked(ctx.channel, msg[:1900])
     await send_chunked(ctx.channel, f"```json\n{json_blob}\n```")
 
+@bot.command(name="lfg")
+@commands.guild_only()
+async def lfg_command(ctx: commands.Context, target: str, *, message: str | None = None):
+    """
+    Usage:
+      !lfg public  [message]  -> ping Driving Ping in #lfg (public)
+      !lfg paddock [message]  -> ping Driving Ping in #paddock-lounge
+    """
+
+    # 1) Restrict where this command can be used
+    if ctx.channel.id != LFG_SOURCE_CHANNEL_ID:
+        await ctx.reply(
+            "Use this command in the #looking-for-group-pings channel.",
+            mention_author=False,
+        )
+        return
+
+    # 2) Ensure caller is a member (Discovery or Mastery)
+    if not isinstance(ctx.author, discord.Member) or not user_has_any_role(ctx.author, MEMBER_ROLE_NAMES):
+        await ctx.reply(
+            "Only Lumeris members can start LFG pings.",
+            mention_author=False,
+        )
+        return
+
+    # 3) Normalize and validate target
+    target = target.lower()
+    if target not in ("public", "paddock"):
+        await ctx.reply(
+            "Usage: `!lfg public <message>` or `!lfg paddock <message>`",
+            mention_author=False,
+        )
+        return
+
+    # 4) Resolve destination channel
+    dest_channel_id = LFG_PUBLIC_CHANNEL_ID if target == "public" else PADDOCK_LOUNGE_CHANNEL_ID
+    dest_channel = ctx.guild.get_channel(dest_channel_id)
+    if dest_channel is None:
+        await ctx.reply(
+            "I couldn't find the destination channel. Check my channel IDs in the config.",
+            mention_author=False,
+        )
+        return
+
+    # 5) Resolve the opt-in ping role
+    ping_role = discord.utils.get(ctx.guild.roles, name=LFG_ROLE_NAME)
+    if ping_role is None:
+        await ctx.reply(
+            f"I couldn't find a role named `{LFG_ROLE_NAME}`. "
+            "Create it or update my config.",
+            mention_author=False,
+        )
+        return
+
+    # 6) Build and send the ping
+    base = f"{ping_role.mention} — {ctx.author.mention} is looking for a group."
+    if message:
+        base += f" {message}"
+
+    await dest_channel.send(base)
+
+    # 7) Confirm back in the source channel without extra pings
+    await ctx.reply(
+        f"LFG ping sent to {dest_channel.mention}.",
+        mention_author=False,
+    )
 
 
 # Backfill config
