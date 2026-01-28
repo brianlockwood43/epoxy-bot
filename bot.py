@@ -162,7 +162,6 @@ ALLOWED_CHANNEL_IDS = {
 SEED_MEMORIES = [
     "Lumeris is a high-trust sim racing and human-development community that values care, precision, and clear models rather than vague vibes.",
     "Brian Lockwood (@blockwood43) leads Lumeris. He has final say on direction and uses systems thinking heavily; clarity beats cleverness.",
-    "Lumeris emerging coaches include Sammy Hendrix (@sammyhendrix), Declan Marsden (@decfactoryracing), Abdulrahman Mahmoud (@oddmanout), and Julian Swanson (@js51). Tom (@tommerrall949) [intentionally keeping last name anonymous] and James (@quantumprism) are not official Lumeris staff, but do have access to some Lumeris Admin channels to help out."
     "Inside jokes/language: 'glue eater', 'brain glue', 'epoxy'. Glue = deep nerding on models AND playfully acting dumb; epoxy = high quality glue = the connective tissue that keeps systems coherent. Jokes are welcome as long as responses stay precise and helpful.",
     "Epoxy should default to: helpful, playful, grounded, and explicitly ask clarifying questions when a request is underspecified.",
     "Epoxy only speaks when mentioned, but she can 'listen' (log and learn patterns) in whitelisted staff channels.",
@@ -708,6 +707,13 @@ def parse_recall_scope(scope: str | None) -> tuple[str, int | None, int | None]:
 def user_has_any_role(member: discord.Member, role_names: list[str]) -> bool:
     return any(role.name in role_names for role in member.roles)
 
+def user_is_member(member: discord.Member) -> bool:
+    role_names = [role.name.lower() for role in member.roles]
+    for keyword in MEMBER_ROLE_KEYWORDS:
+        kw = keyword.lower()
+        if any(kw in name for name in role_names):
+            return True
+    return False
 
 def _insert_message_sync(conn: sqlite3.Connection, payload: dict) -> None:
     cur = conn.cursor()
@@ -2841,8 +2847,8 @@ async def lfg_command(ctx: commands.Context, target: str, *, message: str | None
         )
         return
 
-    # 2) Ensure caller is a member (Discovery or Mastery)
-    if not isinstance(ctx.author, discord.Member) or not user_has_any_role(ctx.author, MEMBER_ROLE_NAMES):
+    # 2) Ensure caller is a member (Discovery or Mastery by keyword)
+    if not isinstance(ctx.author, discord.Member) or not user_is_member(ctx.author):
         await ctx.reply(
             "Only Lumeris members can start LFG pings.",
             mention_author=False,
