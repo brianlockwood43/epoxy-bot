@@ -63,7 +63,7 @@ WELCOME_CHANNEL_ID = 1412264372490731520  # #welcome or #start-here channel ID
 ACCESS_ROLE_KEYWORD = "Visitor"          # substring in your access role name
 DRIVING_ROLE_KEYWORD = "Driving Ping"   # substring in your driving ping role name
 
-FULL_ACCESS_URL = "https://lumerisracing.com/paddock"  # blue diamond link target
+FULL_ACCESS_URL = "https://lumerisracing.com/membership"  # blue diamond link target
 
 
 # Stage gating (default conservative; set env to enable higher stages)
@@ -2279,7 +2279,7 @@ class WelcomePanel(discord.ui.View):
         else:
             await member.add_roles(role, reason="Welcome panel: enable driving pings")
             await interaction.response.send_message(
-                "Driving Pings enabled. You'll get casual race pings.",
+                "Driving Pings enabled.",
                 ephemeral=True,
             )
 
@@ -2996,7 +2996,7 @@ async def lfg_command(ctx: commands.Context, target: str, *, message: str | None
     """
     Usage:
       !lfg public  [message]  -> ping Driving Ping in #lfg (public)
-      !lfg paddock [message]  -> ping Driving Ping in #paddock-lounge
+      !lfg members [message]  -> ping Driving Ping in #paddock-lounge
     """
 
     # 1) Restrict where this command can be used
@@ -3017,9 +3017,9 @@ async def lfg_command(ctx: commands.Context, target: str, *, message: str | None
 
     # 3) Normalize and validate target
     target = target.lower()
-    if target not in ("public", "paddock"):
+    if target not in ("public", "members"):
         await ctx.reply(
-            "Usage: `!lfg public <message>` or `!lfg paddock <message>`",
+            "Usage: `!lfg public <message>` or `!lfg members <message>`",
             mention_author=False,
         )
         return
