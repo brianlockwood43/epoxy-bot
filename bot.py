@@ -2195,7 +2195,7 @@ class WelcomePanel(discord.ui.View):
     @discord.ui.button(
         label="Access the server",
         emoji="🔶",
-        style=discord.ButtonStyle.primary,
+        style=discord.ButtonStyle.secondary,
         custom_id="welcome_access"
     )
     async def access_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2244,7 +2244,7 @@ class WelcomePanel(discord.ui.View):
             )
 
     @discord.ui.button(
-        label="Driving pings",
+        label="Driving Pings",
         emoji="🏎️",   # or "🎮" / "🕹️"
         style=discord.ButtonStyle.secondary,
         custom_id="welcome_driving"
