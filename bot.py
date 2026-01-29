@@ -58,6 +58,14 @@ PADDOCK_LOUNGE_CHANNEL_ID = 1410966350196768809  # #paddock-lounge (members)
 LFG_ROLE_NAME   = "Driving Pings"    # opt-in ping role
 MEMBER_ROLE_KEYWORDS = ["Discovery", "Mastery"]
 
+WELCOME_CHANNEL_ID = 1412264372490731520  # #welcome or #start-here channel ID
+
+ACCESS_ROLE_KEYWORD = "Visitor"          # substring in your access role name
+DRIVING_ROLE_KEYWORD = "Driving Ping"   # substring in your driving ping role name
+
+FULL_ACCESS_URL = "https://lumerisracing.com/paddock"  # blue diamond link target
+
+
 # Stage gating (default conservative; set env to enable higher stages)
 MEMORY_STAGE = os.getenv("EPOXY_MEMORY_STAGE", "M0").strip().upper()
 STAGE_RANK = {"M0": 0, "M1": 1, "M2": 2, "M3": 3}
@@ -703,6 +711,13 @@ def parse_recall_scope(scope: str | None) -> tuple[str, int | None, int | None]:
             continue
 
     return (temporal, guild_id, channel_id)
+
+def find_role_by_keyword(guild: discord.Guild, keyword: str) -> discord.Role | None:
+    keyword = keyword.lower()
+    for role in guild.roles:
+        if keyword in role.name.lower():
+            return role
+    return None
 
 def user_has_any_role(member: discord.Member, role_names: list[str]) -> bool:
     return any(role.name in role_names for role in member.roles)
@@ -2161,6 +2176,120 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+class WelcomePanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Access the server",
+        emoji="🔶",
+        style=discord.ButtonStyle.primary,
+        custom_id="welcome_access"
+    )
+    async def access_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if guild is None:
+            return
+
+        role = find_role_by_keyword(guild, ACCESS_ROLE_KEYWORD)
+        if role is None:
+            await interaction.response.send_message(
+                "I can't find the access role. Ask Brian to fix my config.",
+                ephemeral=True,
+            )
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "This only works inside the server.",
+                ephemeral=True,
+            )
+            return
+
+        if role in member.roles:
+            await member.remove_roles(role, reason="Welcome panel: remove access")
+            await interaction.response.send_message(
+                "Access role removed. Your view will be limited again.",
+                ephemeral=True,
+            )
+        else:
+            await member.add_roles(role, reason="Welcome panel: grant access")
+            await interaction.response.send_message(
+                "Access granted. ✅\n\n"
+                "Hi, I'm **Epoxy** – the little brain running in the background of Lumeris.\n"
+                "I'm still under heavy development, but my job is to help you learn faster, "
+                "find good practice, and make this place easier to navigate.\n\n"
+                "For now, your access role is set and more channels should have just unlocked.\n"
+                "Over time, I'll learn to do things like:\n"
+                "- surface useful resources for whatever you're working on\n"
+                "- help schedule and ping practice groups\n"
+                "- give you smart feedback based on your sessions and questions\n\n"
+                "If you get lost or need help, just ask - our community tends to be happy to help.\n"
+                "Soon, you'll be able to ask me questions, too. I just need to get a little smarter first. \n"
+                "Welcome in, and I'm looking forward to working with you soon!🧠✨",
+                ephemeral=True,
+            )
+
+    @discord.ui.button(
+        label="Driving pings",
+        emoji="🏎️",   # or "🎮" / "🕹️"
+        style=discord.ButtonStyle.secondary,
+        custom_id="welcome_driving"
+    )
+    async def driving_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if guild is None:
+            return
+
+        role = find_role_by_keyword(guild, DRIVING_ROLE_KEYWORD)
+        if role is None:
+            await interaction.response.send_message(
+                "I can't find the Driving Ping role. Ask Brian to fix my config.",
+                ephemeral=True,
+            )
+            return
+
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "This only works inside the server.",
+                ephemeral=True,
+            )
+            return
+
+        if role in member.roles:
+            await member.remove_roles(role, reason="Welcome panel: disable driving pings")
+            await interaction.response.send_message(
+                "Driving Pings disabled. You won't get race notifications.",
+                ephemeral=True,
+            )
+        else:
+            await member.add_roles(role, reason="Welcome panel: enable driving pings")
+            await interaction.response.send_message(
+                "Driving Pings enabled. You'll get casual race pings.",
+                ephemeral=True,
+            )
+
+    @discord.ui.button(
+        label="Get full access",
+        emoji="🔷",
+        style=discord.ButtonStyle.link,
+        url=FULL_ACCESS_URL
+    )
+    async def full_access_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Link buttons don't actually fire a callback; this won't run.
+        # It's here just to satisfy the decorator pattern.
+        pass
+
+@bot.event
+async def on_ready():
+    # Register persistent view so existing welcome-panel buttons keep working
+    bot.add_view(WelcomePanel())
+
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print("------")
+
 # =========================
 # COMMANDS (staff tooling)
 # =========================
@@ -2169,6 +2298,36 @@ def _in_allowed_channel(ctx: commands.Context) -> bool:
         return int(ctx.channel.id) in ALLOWED_CHANNEL_IDS
     except Exception:
         return False
+    
+@bot.command(name="setup_welcome_panel")
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def setup_welcome_panel(ctx: commands.Context):
+    """One-time command to post the welcome / role panel."""
+    if ctx.channel.id != WELCOME_CHANNEL_ID:
+        await ctx.reply(
+            "Run this in the designated welcome channel.",
+            mention_author=False,
+        )
+        return
+
+    embed = discord.Embed(
+        title="Welcome to Lumeris",
+        description=(
+            "🔶 **Access the server**\n"
+            "Unlock the main community channels once you're ready to look around.\n\n"
+            "🔷 **Get full access**\n"
+            "Opens our external page where you can become a full Lumeris member.\n\n"
+            "🏎️ **Driving pings**\n"
+            "Opt in to casual race notifications when members are looking for a group."
+        ),
+        colour=discord.Colour.orange(),
+    )
+
+    view = WelcomePanel()
+    await ctx.send(embed=embed, view=view)
+    await ctx.reply("Welcome panel posted.", mention_author=False)
+
 
 @bot.command(name="memstage")
 async def memstage(ctx: commands.Context):
