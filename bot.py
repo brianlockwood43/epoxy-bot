@@ -2180,6 +2180,17 @@ class WelcomePanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+        # 🔷 Link button: Get full access (no callback needed)
+        self.add_item(
+            discord.ui.Button(
+                label="Get full access",
+                emoji="🔷",
+                style=discord.ButtonStyle.link,
+                url=FULL_ACCESS_URL,
+            )
+        )
+
+
     @discord.ui.button(
         label="Access the server",
         emoji="🔶",
@@ -2270,17 +2281,6 @@ class WelcomePanel(discord.ui.View):
                 "Driving Pings enabled. You'll get casual race pings.",
                 ephemeral=True,
             )
-
-    @discord.ui.button(
-        label="Get full access",
-        emoji="🔷",
-        style=discord.ButtonStyle.link,
-        url=FULL_ACCESS_URL
-    )
-    async def full_access_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Link buttons don't actually fire a callback; this won't run.
-        # It's here just to satisfy the decorator pattern.
-        pass
 
 @bot.event
 async def on_ready():
