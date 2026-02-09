@@ -82,7 +82,7 @@ def _normalize_mode_value(value: str) -> str | None:
     if not raw:
         return None
     token = raw.replace("-", "_").replace(" ", "_")
-    if token in {"auto", "collab", "best_effort"}:
+    if token in {"auto", "collab"}:
         return token
     return None
 

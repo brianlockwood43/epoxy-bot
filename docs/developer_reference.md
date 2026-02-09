@@ -327,10 +327,15 @@ For DM draft episodes, `implicit_signals_json` includes structured artifact keys
   - `my_goals`
   - `non_negotiables`
   - `tone`
-  - optional `mode` (`auto|collab|best_effort`; supports `mode:` and `mode=`)
+  - optional `mode` (`auto|collab`; supports `mode:` and `mode=`)
 - Collab behavior:
-  - default: draft + up to 2 concise follow-up questions
-  - conditional blocking before draft if critical fields are missing:
+  - draft is blocked until required context fields are provided:
+    - missing `objective`
+    - missing `situation_context`
+    - missing `my_goals`
+    - missing `non_negotiables`
+    - missing `tone`
+  - additional conditional blocking before draft if critical fields are missing:
     - missing `target`
     - missing `objective`
     - missing `non_negotiables` when context implies boundary/safety risk

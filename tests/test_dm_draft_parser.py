@@ -64,7 +64,7 @@ tone: warm-direct
         parsed = parse_dm_draft_request(
             "objective=x; situation_context=y; my_goals=a; non_negotiables=b; tone=steady; mode=best_effort"
         )
-        self.assertEqual(parsed.request.mode, "best_effort")
+        self.assertIsNone(parsed.request.mode)
 
     def test_invalid_mode_ignored(self):
         parsed = parse_dm_draft_request(

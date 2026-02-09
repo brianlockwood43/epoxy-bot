@@ -10,7 +10,6 @@ import discord
 from controller.dm_episode_artifact import build_dm_episode_artifact
 from controller.dm_draft_parser import parse_dm_draft_request
 from controller.dm_draft_service import DmDraftRun
-from controller.dm_draft_service import apply_best_effort_assumptions
 from controller.dm_draft_service import build_collab_questions
 from controller.dm_draft_service import build_dm_prompt_messages
 from controller.dm_draft_service import compute_recall_coverage
@@ -432,19 +431,17 @@ def register_runtime_events(
                     clarifying_questions = build_collab_questions(
                         critical_missing_fields if blocking_collab else parsed.missing_fields
                     ) if mode == "collab" else []
-                    should_offer_best_effort_confirm = (
-                        mode == "collab"
-                        and not blocking_collab
-                        and (mode_requested is None or str(mode_requested).strip().lower() == "auto")
-                        and mode_inferred == "best_effort"
-                        and parsed.parse_quality in {"partial", "insufficient"}
-                    )
-                    if should_offer_best_effort_confirm:
-                        confirm_line = (
-                            "If speed matters more than precision, reply `mode=best_effort` and "
-                            "I'll draft immediately with explicit assumptions."
-                        )
-                        clarifying_questions = [confirm_line] + clarifying_questions[:2]
+
+                    # Collaboration-only policy: never draft from partial/insufficient parse.
+                    if parsed.parse_quality in {"partial", "insufficient"}:
+                        blocking_collab = True
+                        critical_missing_fields = list(parsed.missing_fields)
+                        blocking_reason = "missing_required_fields"
+                        clarifying_questions = build_collab_questions(parsed.missing_fields)
+                        if str(mode_requested or "").strip().lower().replace("-", "_") == "best_effort":
+                            clarifying_questions = [
+                                "Best-effort mode is disabled. Please answer these to continue:"
+                            ] + clarifying_questions[:2]
 
                     if blocking_collab:
                         lines = [
@@ -549,7 +546,7 @@ def register_runtime_events(
                                 await asyncio.to_thread(deps.insert_episode_log_sync, deps.db_conn, episode_payload)
                         return
 
-                    req, assumptions_used = apply_best_effort_assumptions(req, parsed.missing_fields)
+                    assumptions_used: list[str] = []
                     prompt_fingerprint = _build_prompt_fingerprint(
                         target=req.target,
                         target_user_id=req.target_user_id,

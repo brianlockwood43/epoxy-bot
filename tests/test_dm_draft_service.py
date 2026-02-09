@@ -15,17 +15,17 @@ from controller.dm_draft_parser import DmDraftRequest
 
 
 class DmDraftServiceTests(unittest.TestCase):
-    def test_mode_inference_urgency_to_best_effort(self):
+    def test_mode_inference_urgency_still_collab(self):
         text = "No time, just draft this ASAP!!! I'm cooked."
-        self.assertEqual(infer_completion_mode(text), "best_effort")
+        self.assertEqual(infer_completion_mode(text), "collab")
 
     def test_mode_inference_reflective_to_collab(self):
         text = "Help me think this through and ask me what is missing."
         self.assertEqual(infer_completion_mode(text), "collab")
 
-    def test_mode_inference_tie_defaults_best_effort(self):
+    def test_mode_inference_tie_defaults_collab(self):
         text = "help me think but also urgent"
-        self.assertEqual(infer_completion_mode(text), "best_effort")
+        self.assertEqual(infer_completion_mode(text), "collab")
 
     def test_recall_coverage_thresholds(self):
         self.assertEqual(compute_recall_coverage(0)["level"], "thin")
@@ -76,7 +76,7 @@ class DmDraftServiceTests(unittest.TestCase):
             prompt_text="urgent no time do your best",
         )
         self.assertEqual(mode_used, "collab")
-        self.assertEqual(mode_inferred, "best_effort")
+        self.assertEqual(mode_inferred, "collab")
 
     def test_select_mode_defaults_to_auto_heuristic(self):
         mode_used, mode_inferred = select_mode(
@@ -86,12 +86,20 @@ class DmDraftServiceTests(unittest.TestCase):
         self.assertEqual(mode_inferred, "collab")
         self.assertEqual(mode_used, "collab")
 
-    def test_select_mode_auto_urgency_still_uses_collab(self):
+    def test_select_mode_auto_uses_collab(self):
         mode_used, mode_inferred = select_mode(
             mode_requested=None,
             prompt_text="No time, just draft this ASAP!!! I'm cooked.",
         )
-        self.assertEqual(mode_inferred, "best_effort")
+        self.assertEqual(mode_inferred, "collab")
+        self.assertEqual(mode_used, "collab")
+
+    def test_select_mode_ignores_best_effort_override(self):
+        mode_used, mode_inferred = select_mode(
+            mode_requested="best_effort",
+            prompt_text="No time, just draft this ASAP!!! I'm cooked.",
+        )
+        self.assertEqual(mode_inferred, "collab")
         self.assertEqual(mode_used, "collab")
 
     def test_collab_blocks_when_target_missing(self):

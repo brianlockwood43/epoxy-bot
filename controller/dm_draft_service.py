@@ -56,57 +56,20 @@ BOUNDARY_CONTEXT_MARKERS = {
 
 
 def infer_completion_mode(text: str) -> str:
-    raw = (text or "").strip()
-    low = raw.lower()
-    best_effort_markers = [
-        "just draft",
-        "do your best",
-        "no time",
-        "urgent",
-        "asap",
-        "im cooked",
-        "i'm cooked",
-        "i am cooked",
-        "brain fried",
-    ]
-    collab_markers = [
-        "help me think",
-        "ask me",
-        "lets refine",
-        "let's refine",
-        "work with me",
-        "co-create",
-        "iterate with me",
-    ]
-
-    best_score = sum(1 for marker in best_effort_markers if marker in low)
-    collab_score = sum(1 for marker in collab_markers if marker in low)
-
-    if re.search(r"[!?]{3,}", raw):
-        best_score += 1
-    alpha = re.findall(r"[A-Za-z]", raw)
-    if alpha:
-        upper_ratio = sum(1 for ch in alpha if ch.isupper()) / max(1, len(alpha))
-        if upper_ratio >= 0.35 and len(alpha) >= 8:
-            best_score += 1
-
-    if collab_score > best_score:
-        return "collab"
-    return "best_effort"
+    _ = text
+    # Best-effort drafting is disabled; DM drafting is collaboration-only.
+    return "collab"
 
 
 def select_mode(*, mode_requested: str | None, prompt_text: str) -> tuple[str, str]:
     """
     Returns (mode_used, mode_inferred).
-    Precedence:
-    1) explicit mode override (collab|best_effort)
-    2) auto/default -> heuristic inference
+    DM drafting is collaboration-only; explicit/implicit best_effort is ignored.
     """
     mode_inferred = infer_completion_mode(prompt_text)
     requested = (mode_requested or "").strip().lower().replace("-", "_")
-    if requested in {"collab", "best_effort"}:
-        return (requested, mode_inferred)
-    # Trial policy: auto/default is collaboration-first.
+    if requested == "collab":
+        return ("collab", mode_inferred)
     return ("collab", mode_inferred)
 
 
@@ -127,30 +90,6 @@ def build_collab_questions(missing_fields: list[str]) -> list[str]:
         if len(questions) >= 2:
             break
     return questions
-
-
-def apply_best_effort_assumptions(req: DmDraftRequest, missing_fields: list[str]) -> tuple[DmDraftRequest, list[str]]:
-    assumptions: list[str] = []
-    if "objective" in missing_fields and not req.objective.strip():
-        req.objective = "Send a clear, respectful DM that reduces escalation and supports next-step alignment."
-        assumptions.append("objective=de-escalate + align next step")
-    if "situation_context" in missing_fields and not req.situation_context.strip():
-        req.situation_context = "Limited explicit situation context was provided in this turn."
-        assumptions.append("situation_context=limited explicit context")
-    if "my_goals" in missing_fields and not req.my_goals:
-        req.my_goals = ["Protect trust while supporting long-term growth and accountability."]
-        assumptions.append("my_goals=trust + long-term growth")
-    if "non_negotiables" in missing_fields and not req.non_negotiables:
-        req.non_negotiables = [
-            "No mind-reading claims.",
-            "No shaming or contempt.",
-            "Keep language concrete and observable.",
-        ]
-        assumptions.append("non_negotiables=default safety set")
-    if "tone" in missing_fields and not req.tone.strip():
-        req.tone = "steady"
-        assumptions.append("tone=steady")
-    return (req, assumptions)
 
 
 def _context_implies_boundary_risk(text: str) -> bool:
