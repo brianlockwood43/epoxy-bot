@@ -1,0 +1,43 @@
+version: dm_guidelines_v1
+output_contract:
+  sections:
+    - drafts
+    - risk_notes
+    - optional_tighten
+    - recall_coverage
+  drafts:
+    min: 1
+    max: 3
+  risk_notes:
+    min: 2
+    max: 8
+
+non_negotiables:
+  - No mind-reading claims.
+  - No shaming language.
+  - Preserve dignity and relationship continuity.
+  - Keep member-facing language concrete and observable.
+
+observables_language_rules:
+  - Reflect observable patterns (fast/intense/all-or-nothing) rather than hidden motives.
+  - Use hedged language when uncertain and invite correction.
+  - Avoid diagnostic framing unless explicitly requested and clearly grounded.
+
+non_mind_reading_constraints:
+  - Do not claim certainty about private internal states.
+  - If naming overload, use plain language and keep it optional.
+
+regulation_support_moves:
+  - Offer 2-3 choices that reduce pressure and support agency.
+  - Suggest pacing moves when intensity is high.
+  - Keep asks specific and bounded in time.
+
+disallowed_moves:
+  - Contempt, mockery, or moral grandstanding.
+  - Privacy leakage about other members.
+  - Escalatory accusations without clear evidence.
+
+voice_constraints:
+  - Respectful, clear, direct.
+  - Warm but not indulgent.
+  - Concise and actionable.

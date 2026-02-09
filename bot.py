@@ -5,11 +5,94 @@ import json
 import re
 import time
 import hashlib
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import discord
 from discord.ext import commands
 from openai import OpenAI
+from config.defaults import ACCESS_ROLE_KEYWORD
+from config.defaults import DEFAULT_ALLOWED_CHANNEL_IDS
+from config.defaults import DEFAULT_BACKFILL_LIMIT
+from config.defaults import DEFAULT_BACKFILL_PAUSE_EVERY
+from config.defaults import DEFAULT_BACKFILL_PAUSE_SECONDS
+from config.defaults import DEFAULT_RECENT_CONTEXT_LIMIT
+from config.defaults import DEFAULT_RECENT_CONTEXT_LINE_CHARS
+from config.defaults import DEFAULT_RECENT_CONTEXT_MAX_CHARS
+from config.defaults import DEFAULT_TOPIC_ALLOWLIST
+from config.defaults import DRIVING_ROLE_KEYWORD
+from config.defaults import DEFAULT_ANNOUNCE_PREP_CHANNEL_ID
+from config.defaults import FULL_ACCESS_URL
+from config.defaults import LFG_PUBLIC_CHANNEL_ID
+from config.defaults import LFG_ROLE_NAME
+from config.defaults import LFG_SOURCE_CHANNEL_ID
+from config.defaults import MEMBER_ROLE_KEYWORDS
+from config.defaults import PADDOCK_LOUNGE_CHANNEL_ID
+from config.defaults import RESERVED_KIND_TAGS
+from config.defaults import STAGE_RANK
+from config.defaults import WELCOME_CHANNEL_ID
+from controller.dm_guidelines import load_dm_guidelines
+from controller.context import (
+    classify_context,
+    parse_id_set,
+    parse_str_set,
+    resolve_allowed_channel_ids,
+    resolve_channel_groups,
+)
+from controller.store import (
+    fetch_episode_logs_sync,
+    get_or_create_context_profile_sync,
+    insert_episode_log_sync,
+    select_active_controller_config_sync,
+    update_latest_dm_draft_evaluation_sync,
+    update_latest_dm_draft_feedback_sync,
+    upsert_user_profile_last_seen_sync,
+)
+from db.migrate import apply_sqlite_migrations
+from ingestion.service import log_message as log_message_service
+from ingestion.store import fetch_last_messages_by_author_sync as fetch_last_messages_by_author_store
+from ingestion.store import fetch_latest_messages_sync as fetch_latest_messages_store
+from ingestion.store import fetch_messages_since_sync as fetch_messages_since_store
+from ingestion.store import fetch_recent_context_sync as fetch_recent_context_store
+from ingestion.store import get_backfill_done_sync as get_backfill_done_store
+from ingestion.store import insert_message_sync as insert_message_store
+from ingestion.store import reset_all_backfill_done_sync as reset_all_backfill_done_store
+from ingestion.store import reset_backfill_done_sync as reset_backfill_done_store
+from ingestion.store import set_backfill_done_sync as set_backfill_done_store
+from jobs.service import maintenance_loop as maintenance_loop_service
+from jobs.service import summarize_topic as summarize_topic_service
+from jobs.announcements import announcement_loop as announcement_loop_service
+from memory.service import extract_json_array as extract_json_array_service
+from memory.service import get_topic_candidates as get_topic_candidates_service
+from memory.service import remember_event as remember_event_service
+from memory.service import safe_extract_json_obj as safe_extract_json_obj_service
+from memory.service import suggest_topic_id as suggest_topic_id_service
+from memory.store import cleanup_memory_sync as cleanup_memory_store
+from memory.store import fetch_latest_memory_events_sync as fetch_latest_memory_events_store
+from memory.store import fetch_memory_events_since_sync as fetch_memory_events_since_store
+from memory.store import fetch_topic_events_sync as fetch_topic_events_store
+from memory.store import get_topic_summary_sync as get_topic_summary_store
+from memory.store import insert_memory_event_sync as insert_memory_event_store
+from memory.store import list_known_topics_sync as list_known_topics_store
+from memory.store import mark_events_summarized_sync as mark_events_summarized_store
+from memory.store import search_memory_events_by_tag_sync as search_memory_events_by_tag_store
+from memory.store import search_memory_events_sync as search_memory_events_store
+from memory.store import search_memory_summaries_sync as search_memory_summaries_store
+from memory.store import set_memory_origin_sync as set_memory_origin_store
+from memory.store import topic_counts_sync as topic_counts_store
+from memory.store import upsert_summary_sync as upsert_summary_store
+from misc.runtime_wiring import wire_bot_runtime
+from misc.adhoc_modules.announcements_service import AnnouncementService
+from misc.adhoc_modules.announcements_service import default_templates_path as announcement_templates_path_default
+from misc.adhoc_modules.welcome_panel import build_welcome_panel
+from retrieval.service import budget_and_diversify_events as retrieval_budget_and_diversify_events
+from retrieval.service import format_memory_events_window as format_memory_events_window_service
+from retrieval.service import format_memory_for_llm as format_memory_for_llm_service
+from retrieval.service import format_profile_for_llm as format_profile_for_llm_service
+from retrieval.service import format_recent_context as format_recent_context_service
+from retrieval.service import get_recent_channel_context as get_recent_channel_context_service
+from retrieval.service import parse_duration_to_minutes as parse_duration_to_minutes_service
+from retrieval.service import recall_memory as recall_memory_service
 
+# See AGENTS.md for complete roadmap and context
 
 # =========================
 # ENV
@@ -27,16 +110,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 # =========================
 # MEMORY STAGING
 # =========================
-# Stages:
-#   M0: baseline (recent channel context only)
-#   M1: persistent event memory + recall
-#   M2: temporal tiers (hot/warm/cold) + tier-aware recall/cleanup
-#   M3: summaries (topic gists) + optional consolidation jobs
-#   M4: manual meta-memories/narrative and role arcs
-#   M5: semi-automatic human-in-loop memories being connected to manual meta-memories/narratives and roles
-#   M6: semi-automatic human-in-loop self suggestion of meta-memories/narratives and roles connected to memories
-#   M7: fully autonomous creation and management of memories and meta-memories/narratives+roles
-#
+
 # Control via env:
 #   EPOXY_MEMORY_STAGE = M0 | M1 | M2 | M3   (default: M0)
 #   EPOXY_MEMORY_ENABLE_AUTO_CAPTURE = 0/1   (default: 0)
@@ -47,28 +121,10 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 #   but you can keep runtime behavior at M0/M1/M2 with the stage flags.
 #
 # ---- Memory / staging config (drop-in) ----
-import os
-import re
-
-# IDs: right-click channel → Copy ID (with Developer Mode on)
-LFG_SOURCE_CHANNEL_ID     = 1465985366908600506  # #looking-for-group-pings
-LFG_PUBLIC_CHANNEL_ID     = 1465824527043919986  # #lfg (public)
-PADDOCK_LOUNGE_CHANNEL_ID = 1410966350196768809  # #paddock-lounge (members)
-
-LFG_ROLE_NAME   = "Driving Pings"    # opt-in ping role
-MEMBER_ROLE_KEYWORDS = ["Discovery", "Mastery"]
-
-WELCOME_CHANNEL_ID = 1412264372490731520  # #welcome or #start-here channel ID
-
-ACCESS_ROLE_KEYWORD = "Visitor"          # substring in your access role name
-DRIVING_ROLE_KEYWORD = "Driving Ping"   # substring in your driving ping role name
-
-FULL_ACCESS_URL = "https://lumerisracing.com/membership"  # blue diamond link target
 
 
 # Stage gating (default conservative; set env to enable higher stages)
 MEMORY_STAGE = os.getenv("EPOXY_MEMORY_STAGE", "M0").strip().upper()
-STAGE_RANK = {"M0": 0, "M1": 1, "M2": 2, "M3": 3}
 MEMORY_STAGE_RANK = STAGE_RANK.get(MEMORY_STAGE, 0)
 
 def stage_at_least(stage: str) -> bool:
@@ -88,22 +144,13 @@ try:
 except ValueError:
     TOPIC_MIN_CONF = 0.85
 
-RESERVED_KIND_TAGS = {"decision", "policy", "canon", "profile", "protocol"}
-
-_DEFAULT_TOPIC_ALLOWLIST = (
-    "ops,announcements,community,coaches,workshops,league,one_on_one,"
-    "member_support,conflict_resolution,marketing,content,website,pricing,billing,"
-    "roadmap,infra,bugs,deployments,epoxy_bot,experiments,baby_brain,"
-    "console_bay,coaching_method,layer_model,telemetry,track_guides"
-)
-
 # Allowlist behavior:
 # - If env var is unset: use default allowlist above.
 # - If env var is set to empty/whitespace: treat as "no explicit allowlist" (fallback to known DB topics).
 # - Otherwise: parse env var.
 _raw = os.getenv("EPOXY_TOPIC_ALLOWLIST")
 if _raw is None:
-    _TOPIC_ALLOWLIST_RAW = _DEFAULT_TOPIC_ALLOWLIST
+    _TOPIC_ALLOWLIST_RAW = DEFAULT_TOPIC_ALLOWLIST
 else:
     _TOPIC_ALLOWLIST_RAW = _raw.strip()
 
@@ -130,39 +177,80 @@ DB_PATH = os.getenv("EPOXY_DB_PATH", "epoxy_memory.db")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
-# ALLOWED CHANNELS
+# ALLOWED CHANNELS + CONTEXT POLICY
 # =========================
-ALLOWED_CHANNEL_IDS = {
-    1458572717585600524,
-    1408194344351039580,
-    1458572555823616173,
-    1458572511204610048,
-    1458572485095325747,
-    1458572462760394824,
-    1458572425754316811,
-    1458572343264936145,
-    1458716574260133948,
-    1407828560177004566,
-    1410479714182631474,
-    1410479845447565332,
-    1408225092189556746,
-    1412264637621207071,
-    1408224293120380980,
-    1412303004224327803,
-    1410966350196768809,
-    1412327305723777044,
-    1412328113152720897,
-    1419853202085384323,
-    1460014678947135652,
-    1450640792346431498,
-    1413721242376339527,
-    1413721196851237026,
-    1419737142803824730,
-    1412358211461316698,
-    1465824527043919986,
-    1465985366908600506,
-    1412264372490731520,
-}
+ALLOWED_CHANNEL_IDS = resolve_allowed_channel_ids(DEFAULT_ALLOWED_CHANNEL_IDS)
+CHANNEL_POLICY_GROUPS = resolve_channel_groups()
+
+OWNER_USER_IDS = parse_id_set(os.getenv("EPOXY_OWNER_USER_IDS", "237008609773486080"))
+OWNER_USERNAMES = parse_str_set(os.getenv("EPOXY_OWNER_USERNAMES", "blockwood43"))
+FOUNDER_USER_IDS = parse_id_set(os.getenv("EPOXY_FOUNDER_USER_IDS"))
+if not FOUNDER_USER_IDS and OWNER_USER_IDS:
+    FOUNDER_USER_IDS = set(OWNER_USER_IDS)
+
+ENABLE_EPISODE_LOGGING = os.getenv("EPOXY_ENABLE_EPISODE_LOGGING", "1").strip() == "1"
+# New preferred variable:
+#   EPOXY_EPISODE_LOG_FILTERS
+# Supports caller/context/surface filtering, e.g.:
+#   context:dm,context:public,context:member,context:staff,context:leadership
+# Backward compatibility:
+#   EPOXY_EPISODE_LOG_SURFACES (legacy)
+_episode_filters_raw = os.getenv("EPOXY_EPISODE_LOG_FILTERS")
+if _episode_filters_raw is None:
+    _episode_filters_raw = os.getenv("EPOXY_EPISODE_LOG_SURFACES")
+if _episode_filters_raw is None:
+    _episode_filters_raw = "context:dm,context:public,context:member,context:staff,context:leadership"
+EPISODE_LOG_FILTERS = parse_str_set(_episode_filters_raw)
+print(
+    f"[CFG] allowed_channels={len(ALLOWED_CHANNEL_IDS)} "
+    f"groups(leadership={len(CHANNEL_POLICY_GROUPS['leadership'])}, "
+    f"staff={len(CHANNEL_POLICY_GROUPS['staff'])}, "
+    f"member={len(CHANNEL_POLICY_GROUPS['member'])}, "
+    f"public={len(CHANNEL_POLICY_GROUPS['public'])}) "
+    f"owner_ids={len(OWNER_USER_IDS)} founder_ids={len(FOUNDER_USER_IDS)} "
+    f"episode_logging={ENABLE_EPISODE_LOGGING} filters={len(EPISODE_LOG_FILTERS)}"
+)
+
+# =========================
+# ANNOUNCEMENT AUTOMATION
+# =========================
+ANNOUNCE_ENABLED = os.getenv("EPOXY_ANNOUNCE_ENABLED", "0").strip() == "1"
+ANNOUNCE_TIMEZONE = os.getenv("EPOXY_ANNOUNCE_TIMEZONE", "UTC").strip() or "UTC"
+ANNOUNCE_PREP_TIME_LOCAL = os.getenv("EPOXY_ANNOUNCE_PREP_TIME_LOCAL", "09:00").strip() or "09:00"
+ANNOUNCE_PREP_CHANNEL_ID = int(
+    os.getenv("EPOXY_ANNOUNCE_PREP_CHANNEL_ID", str(DEFAULT_ANNOUNCE_PREP_CHANNEL_ID)).strip()
+    or str(DEFAULT_ANNOUNCE_PREP_CHANNEL_ID)
+)
+ANNOUNCE_PREP_ROLE_NAME = os.getenv("EPOXY_ANNOUNCE_PREP_ROLE_NAME", "").strip()
+ANNOUNCE_TICK_SECONDS = int(os.getenv("EPOXY_ANNOUNCE_TICK_SECONDS", "30").strip() or "30")
+ANNOUNCE_DRY_RUN = os.getenv("EPOXY_ANNOUNCE_DRY_RUN", "0").strip() == "1"
+ANNOUNCE_TEMPLATES_PATH = os.getenv("EPOXY_ANNOUNCE_TEMPLATES_PATH", announcement_templates_path_default())
+_RAW_DM_GUIDELINES_PATH = os.getenv("EPOXY_DM_GUIDELINES_PATH")
+DM_GUIDELINES_PATH = os.getenv(
+    "EPOXY_DM_GUIDELINES_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "dm_guidelines.yml"),
+)
+DM_GUIDELINES, DM_GUIDELINES_WARNING = load_dm_guidelines(DM_GUIDELINES_PATH)
+DM_GUIDELINES_SOURCE = "env_override" if _RAW_DM_GUIDELINES_PATH is not None else "file"
+if DM_GUIDELINES_WARNING:
+    DM_GUIDELINES_SOURCE = "fallback"
+
+print(
+    f"[CFG] announce_enabled={ANNOUNCE_ENABLED} dry_run={ANNOUNCE_DRY_RUN} "
+    f"tz={ANNOUNCE_TIMEZONE} prep_time={ANNOUNCE_PREP_TIME_LOCAL} "
+    f"prep_channel={ANNOUNCE_PREP_CHANNEL_ID} tick_s={ANNOUNCE_TICK_SECONDS}"
+)
+if DM_GUIDELINES_WARNING:
+    print(
+        f"[CFG] dm_guidelines={DM_GUIDELINES.version} "
+        f"source={DM_GUIDELINES_SOURCE} path={DM_GUIDELINES_PATH}"
+    )
+    print(f"[CFG] {DM_GUIDELINES_WARNING}")
+else:
+    print(
+        f"[CFG] dm_guidelines={DM_GUIDELINES.version} "
+        f"source={DM_GUIDELINES_SOURCE} path={DM_GUIDELINES_PATH}"
+    )
 
 # =========================
 # "Seed memories" (Epoxy context pack)
@@ -281,6 +369,23 @@ def _schema_has_columns(cur, table: str, required: list[str]) -> tuple[bool, lis
     missing = [c for c in required if c not in cols]
     return (len(missing) == 0, missing)
 
+
+def _list_schema_migrations_sync(conn: sqlite3.Connection, limit: int = 200) -> list[tuple[str, str, str]]:
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT version, name, applied_at_utc
+            FROM schema_migrations
+            ORDER BY version DESC
+            LIMIT ?
+            """,
+            (max(1, min(int(limit), 500)),),
+        )
+        return cur.fetchall()
+    except sqlite3.OperationalError:
+        return []
+
 # =========================
 # SQLITE
 # =========================
@@ -292,283 +397,64 @@ def init_db(db_path: str) -> sqlite3.Connection:
     # Performance + safety defaults
     cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("PRAGMA synchronous=NORMAL;")
-
-    # Message log (deduped by message_id)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS messages (
-        message_id      INTEGER PRIMARY KEY,
-        guild_id        INTEGER,
-        guild_name      TEXT,
-        channel_id      INTEGER,
-        channel_name    TEXT,
-        author_id       INTEGER,
-        author_name     TEXT,
-        created_at_utc  TEXT,
-        content         TEXT,
-        attachments     TEXT
-    )
-    """)
-
-    # Channel backfill state
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS channel_state (
-        channel_id INTEGER PRIMARY KEY,
-        backfill_done INTEGER DEFAULT 0,
-        last_backfill_at_utc TEXT
-    )
-    """)
-
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel_id ON messages(channel_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_author_id ON messages(author_id)")
-
-
-    # Persistent memory events (M1+), upgraded for M3 parity
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS memory_events (
-        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        -- core timestamps
-        created_at_utc          TEXT,
-        created_ts              INTEGER,
-        updated_at_utc          TEXT,
-        last_verified_at_utc    TEXT,
-        expiry_at_utc           TEXT,
-
-        -- scope/provenance
-        scope                  TEXT DEFAULT NULL,     -- e.g. global | project:X | thread:Y | channel:<id>
-        guild_id               INTEGER,
-        channel_id             INTEGER,
-        channel_name           TEXT,
-        author_id              INTEGER,
-        author_name            TEXT,
-        source_message_id      INTEGER,
-
-        -- "logged from" provenance (already used by you)
-        logged_from_channel_id     INTEGER,
-        logged_from_channel_name   TEXT,
-        logged_from_message_id     INTEGER,
-        source_channel_id          INTEGER,
-        source_channel_name        TEXT,
-
-        -- content + tags
-        type                   TEXT DEFAULT 'event',  -- event|preference|concept|relationship|policy|instruction|skill|artifact_ref|note
-        title                  TEXT DEFAULT NULL,
-        text                   TEXT NOT NULL,
-        tags_json              TEXT,
-
-        -- quality + lifecycle
-        confidence             REAL DEFAULT 0.6,
-        stability              TEXT DEFAULT 'medium', -- volatile|medium|stable
-        lifecycle              TEXT DEFAULT 'active', -- candidate|active|archived|deprecated|deleted
-        superseded_by          INTEGER DEFAULT NULL,
-
-        -- your existing controls
-        importance             INTEGER DEFAULT 0,
-        tier                   INTEGER DEFAULT 1,
-        summarized             INTEGER DEFAULT 0,
-
-        -- topic suggestion (already in your migrations; included here for fresh DBs)
-        topic_id               TEXT,
-        topic_source           TEXT DEFAULT 'manual',
-        topic_confidence       REAL
-    )
-    """)
-
-
-    # M3.5 topic suggestion columns (safe migrations for existing DBs)
-    for stmt in [
-        "ALTER TABLE memory_events ADD COLUMN topic_id TEXT",
-        "ALTER TABLE memory_events ADD COLUMN topic_source TEXT DEFAULT 'manual'",
-        "ALTER TABLE memory_events ADD COLUMN topic_confidence REAL",
-        "ALTER TABLE memory_events ADD COLUMN logged_from_channel_id INTEGER",
-        "ALTER TABLE memory_events ADD COLUMN logged_from_channel_name TEXT",
-        "ALTER TABLE memory_events ADD COLUMN logged_from_message_id INTEGER",
-
-        "ALTER TABLE memory_events ADD COLUMN source_channel_id INTEGER",
-        "ALTER TABLE memory_events ADD COLUMN source_channel_name TEXT",
-    ]:
-        try:
-            cur.execute(stmt)
-        except sqlite3.OperationalError:
-            pass
-
-    # Best-effort backfill: set topic_id from first tag when possible.
-    try:
-        cur.execute("UPDATE memory_events SET topic_id = json_extract(tags_json, '$[0]') WHERE (topic_id IS NULL OR topic_id='') AND tags_json IS NOT NULL AND tags_json != '[]'")
-    except sqlite3.OperationalError:
-        pass
-
-    # =========================
-    # M3 parity migrations (safe for existing DBs)
-    # =========================
-    for stmt in [
-        # memory_events upgrades
-        "ALTER TABLE memory_events ADD COLUMN updated_at_utc TEXT",
-        "ALTER TABLE memory_events ADD COLUMN last_verified_at_utc TEXT",
-        "ALTER TABLE memory_events ADD COLUMN expiry_at_utc TEXT",
-
-        "ALTER TABLE memory_events ADD COLUMN scope TEXT",
-        "ALTER TABLE memory_events ADD COLUMN type TEXT DEFAULT 'event'",
-        "ALTER TABLE memory_events ADD COLUMN title TEXT",
-        "ALTER TABLE memory_events ADD COLUMN confidence REAL DEFAULT 0.6",
-        "ALTER TABLE memory_events ADD COLUMN stability TEXT DEFAULT 'medium'",
-        "ALTER TABLE memory_events ADD COLUMN lifecycle TEXT DEFAULT 'active'",
-        "ALTER TABLE memory_events ADD COLUMN superseded_by INTEGER",
-
-        # memory_summaries upgrades
-        "ALTER TABLE memory_summaries ADD COLUMN summary_type TEXT DEFAULT 'topic_gist'",
-        "ALTER TABLE memory_summaries ADD COLUMN scope TEXT",
-        "ALTER TABLE memory_summaries ADD COLUMN covers_event_ids_json TEXT DEFAULT '[]'",
-        "ALTER TABLE memory_summaries ADD COLUMN confidence REAL DEFAULT 0.6",
-        "ALTER TABLE memory_summaries ADD COLUMN stability TEXT DEFAULT 'medium'",
-        "ALTER TABLE memory_summaries ADD COLUMN last_verified_at_utc TEXT",
-        "ALTER TABLE memory_summaries ADD COLUMN lifecycle TEXT DEFAULT 'active'",
-        "ALTER TABLE memory_summaries ADD COLUMN tier INTEGER DEFAULT 2",
-        "ALTER TABLE memory_summaries ADD COLUMN generated_by_model TEXT",
-        "ALTER TABLE memory_summaries ADD COLUMN prompt_hash TEXT",
-        "ALTER TABLE memory_summaries ADD COLUMN job_id TEXT",
-    ]:
-        try:
-            cur.execute(stmt)
-        except sqlite3.OperationalError:
-            pass
-
-    # -------------------------
-    # Backfills (best-effort)
-    # -------------------------
-    # 1) updated_at_utc / last_verified_at_utc defaults
-    try:
-        cur.execute("UPDATE memory_events SET updated_at_utc = created_at_utc WHERE updated_at_utc IS NULL AND created_at_utc IS NOT NULL")
-        cur.execute("UPDATE memory_events SET last_verified_at_utc = created_at_utc WHERE last_verified_at_utc IS NULL AND created_at_utc IS NOT NULL")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cur.execute("UPDATE memory_summaries SET last_verified_at_utc = updated_at_utc WHERE last_verified_at_utc IS NULL AND updated_at_utc IS NOT NULL")
-        cur.execute("UPDATE memory_summaries SET summary_type = 'topic_gist' WHERE summary_type IS NULL OR summary_type = ''")
-    except sqlite3.OperationalError:
-        pass
-
-    # 2) scope defaults: keep it simple and deterministic
-    #    - if channel_id exists, scope = channel:<id>, else guild:<id>, else global
-    try:
-        cur.execute("""
-            UPDATE memory_events
-            SET scope =
-                CASE
-                    WHEN channel_id IS NOT NULL THEN 'channel:' || channel_id
-                    WHEN guild_id IS NOT NULL THEN 'guild:' || guild_id
-                    ELSE 'global'
-                END
-            WHERE scope IS NULL OR scope = ''
-        """)
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cur.execute("""
-            UPDATE memory_summaries
-            SET scope =
-                CASE
-                    WHEN topic_id IS NOT NULL AND topic_id != '' THEN 'topic:' || topic_id
-                    ELSE 'global'
-                END
-            WHERE scope IS NULL OR scope = ''
-        """)
-    except sqlite3.OperationalError:
-        pass
-
-    # 3) type inference from tags (conservative, only sets if currently default/blank)
-    #    Adjust mapping later; this is just to avoid everything being "event".
-    try:
-        cur.execute("""
-            UPDATE memory_events
-            SET type =
-                CASE
-                    WHEN tags_json LIKE '%"policy"%' THEN 'policy'
-                    WHEN tags_json LIKE '%"protocol"%' THEN 'instruction'
-                    WHEN tags_json LIKE '%"profile"%' THEN 'preference'
-                    WHEN tags_json LIKE '%"decision"%' THEN 'event'
-                    WHEN tags_json LIKE '%"canon"%' THEN 'concept'
-                    ELSE 'event'
-                END
-            WHERE (type IS NULL OR type = '' OR type = 'event')
-              AND tags_json IS NOT NULL AND tags_json != ''
-        """)
-    except sqlite3.OperationalError:
-        pass
-
-    # -------------------------
-    # Indexes for new fields
-    # -------------------------
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_events_scope ON memory_events(scope)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_events_type ON memory_events(type)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_events_lifecycle ON memory_events(lifecycle)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_events_last_verified ON memory_events(last_verified_at_utc)")
-
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_summaries_type ON memory_summaries(summary_type)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_summaries_scope ON memory_summaries(scope)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_summaries_lifecycle ON memory_summaries(lifecycle)")
-
-    # Summaries (M3), upgraded for auditability + multiple summary types
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS memory_summaries (
-        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        -- what kind of summary this is
-        summary_type           TEXT DEFAULT 'topic_gist',  -- event_digest|topic_gist|decision_log|preference_profile
-        scope                  TEXT DEFAULT NULL,         -- same scheme as memory_events.scope
-
-        -- legacy support: topic gists still keyed by topic_id
-        topic_id               TEXT,
-
-        -- time bounds and metadata
-        created_at_utc          TEXT,
-        updated_at_utc          TEXT,
-        start_ts                INTEGER,
-        end_ts                  INTEGER,
-
-        tags_json              TEXT,
-        importance             INTEGER DEFAULT 1,
-
-        -- content
-        summary_text           TEXT NOT NULL,
-
-        -- audit + governance
-        covers_event_ids_json  TEXT DEFAULT '[]',
-        confidence             REAL DEFAULT 0.6,
-        stability              TEXT DEFAULT 'medium',
-        last_verified_at_utc   TEXT,
-        lifecycle              TEXT DEFAULT 'active',
-        tier                   INTEGER DEFAULT 2,
-
-        -- generation metadata
-        generated_by_model     TEXT,
-        prompt_hash            TEXT,
-        job_id                 TEXT
-    )
-    """)
-
-
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_events_created_ts ON memory_events(created_ts)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_events_tier ON memory_events(tier)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_events_importance ON memory_events(importance)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_summaries_topic_id ON memory_summaries(topic_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_summaries_end_ts ON memory_summaries(end_ts)")
-
-    # FTS indexes (contentless) for fast recall
-    # NOTE: we keep rowid aligned with the primary table's id for easy joins.
-    cur.execute("""
-    CREATE VIRTUAL TABLE IF NOT EXISTS memory_events_fts
-    USING fts5(text, tags, tokenize='unicode61')
-    """)
-    cur.execute("""
-    CREATE VIRTUAL TABLE IF NOT EXISTS memory_summaries_fts
-    USING fts5(topic_id, summary_text, tags, tokenize='unicode61')
-    """)
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    migrations_dir = os.path.join(repo_root, "migrations")
+    apply_sqlite_migrations(conn, migrations_dir)
 
     # ---- Schema verification (logs show up in Railway) ----
     try:
+        required_messages = ["message_id", "channel_id", "author_id", "created_at_utc", "content"]
+        required_controller = [
+            ("context_profiles", ["caller_type", "surface", "allowed_capabilities_json"]),
+            ("user_profiles", ["layer_estimate", "risk_flags_json", "last_seen_at_utc"]),
+            ("controller_configs", ["scope", "persona", "depth", "strictness", "intervention_level"]),
+            (
+                "episode_logs",
+                [
+                    "timestamp_utc",
+                    "context_profile_id",
+                    "user_id",
+                    "controller_config_id",
+                    "target_user_id",
+                    "target_display_name",
+                    "target_type",
+                    "target_confidence",
+                    "target_entity_key",
+                    "mode_requested",
+                    "mode_inferred",
+                    "mode_used",
+                    "dm_guidelines_version",
+                    "dm_guidelines_source",
+                    "blocking_collab",
+                    "critical_missing_fields_json",
+                    "blocking_reason",
+                    "draft_version",
+                    "draft_variant_id",
+                    "prompt_fingerprint",
+                ],
+            ),
+        ]
+        required_announcements = [
+            (
+                "announcement_cycles",
+                [
+                    "target_date_local",
+                    "timezone",
+                    "status",
+                    "completion_path",
+                    "publish_at_utc",
+                    "manual_done_link",
+                ],
+            ),
+            (
+                "announcement_answers",
+                ["cycle_id", "question_id", "answer_text", "answered_by_user_id", "answered_at_utc"],
+            ),
+            (
+                "announcement_audit_log",
+                ["cycle_id", "action", "actor_type", "payload_json", "created_at_utc"],
+            ),
+        ]
         required_events = [
             "updated_at_utc", "last_verified_at_utc", "expiry_at_utc",
             "scope", "type", "title", "confidence", "stability", "lifecycle", "superseded_by",
@@ -579,11 +465,19 @@ def init_db(db_path: str) -> sqlite3.Connection:
             "lifecycle", "tier", "generated_by_model", "prompt_hash", "job_id",
         ]
 
+        ok_m, missing_m = _schema_has_columns(cur, "messages", required_messages)
         ok_e, missing_e = _schema_has_columns(cur, "memory_events", required_events)
         ok_s, missing_s = _schema_has_columns(cur, "memory_summaries", required_summaries)
 
+        print(f"[DB] messages schema OK={ok_m} missing={missing_m}")
         print(f"[DB] memory_events schema OK={ok_e} missing={missing_e}")
         print(f"[DB] memory_summaries schema OK={ok_s} missing={missing_s}")
+        for tbl, req in required_controller:
+            ok_t, missing_t = _schema_has_columns(cur, tbl, req)
+            print(f"[DB] {tbl} schema OK={ok_t} missing={missing_t}")
+        for tbl, req in required_announcements:
+            ok_t, missing_t = _schema_has_columns(cur, tbl, req)
+            print(f"[DB] {tbl} schema OK={ok_t} missing={missing_t}")
 
         # Optional: dump the full column lists once (useful early on)
         print(f"[DB] memory_events cols: {_safe_table_info(cur, 'memory_events')}")
@@ -713,16 +607,6 @@ def parse_recall_scope(scope: str | None) -> tuple[str, int | None, int | None]:
 
     return (temporal, guild_id, channel_id)
 
-def find_role_by_keyword(guild: discord.Guild, keyword: str) -> discord.Role | None:
-    keyword = keyword.lower()
-    for role in guild.roles:
-        if keyword in role.name.lower():
-            return role
-    return None
-
-def user_has_any_role(member: discord.Member, role_names: list[str]) -> bool:
-    return any(role.name in role_names for role in member.roles)
-
 def user_is_member(member: discord.Member) -> bool:
     role_names = [role.name.lower() for role in member.roles]
     for keyword in MEMBER_ROLE_KEYWORDS:
@@ -731,94 +615,38 @@ def user_is_member(member: discord.Member) -> bool:
             return True
     return False
 
+
+def user_is_owner(user: discord.abc.User) -> bool:
+    uid = int(getattr(user, "id", 0) or 0)
+    if uid and uid in OWNER_USER_IDS:
+        return True
+    if OWNER_USER_IDS:
+        return False
+
+    names = {
+        str(getattr(user, "name", "") or "").strip().lower(),
+        str(getattr(user, "global_name", "") or "").strip().lower(),
+        str(getattr(user, "display_name", "") or "").strip().lower(),
+    }
+    # Also include discriminator form ("name#1234") for old-style accounts.
+    tag = str(user).strip().lower()
+    if tag:
+        names.add(tag)
+        names.add(tag.split("#", 1)[0])
+    return any(n in OWNER_USERNAMES for n in names if n)
+
 def _insert_message_sync(conn: sqlite3.Connection, payload: dict) -> None:
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT OR IGNORE INTO messages (
-            message_id, guild_id, guild_name,
-            channel_id, channel_name,
-            author_id, author_name,
-            created_at_utc, content, attachments
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            payload["message_id"],
-            payload["guild_id"], payload["guild_name"],
-            payload["channel_id"], payload["channel_name"],
-            payload["author_id"], payload["author_name"],
-            payload["created_at_utc"],
-            payload["content"],
-            payload["attachments"],
-        )
-    )
-    conn.commit()
+    insert_message_store(conn, payload)
 
 def _insert_memory_event_sync(conn: sqlite3.Connection, payload: dict) -> int:
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO memory_events (
-            created_at_utc, created_ts,
-            guild_id, channel_id, channel_name,
-            author_id, author_name,
-            source_message_id,
-            text, tags_json, importance, tier,
-            topic_id, topic_source, topic_confidence,
-            summarized,
-            logged_from_channel_id, logged_from_channel_name, logged_from_message_id,
-            source_channel_id, source_channel_name
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            payload["created_at_utc"],
-            payload["created_ts"],
-            payload.get("guild_id"),
-            payload.get("channel_id"),
-            payload.get("channel_name"),
-            payload.get("author_id"),
-            payload.get("author_name"),
-            payload.get("source_message_id"),
-            payload["text"],
-            payload.get("tags_json", "[]"),
-            int(payload.get("importance", 0)),
-            int(payload.get("tier", 1)),
-            payload.get("topic_id"),
-            payload.get("topic_source", "none"),
-            payload.get("topic_confidence"),
-            int(payload.get("summarized", 0)),
-            payload.get("logged_from_channel_id"),
-            payload.get("logged_from_channel_name"),
-            payload.get("logged_from_message_id"),
-            payload.get("source_channel_id"),
-            payload.get("source_channel_name"),
-        ),
+    return insert_memory_event_store(
+        conn,
+        payload,
+        safe_json_loads=safe_json_loads,
     )
-    mem_id = int(cur.lastrowid)
-
-    # Keep FTS rowid aligned with memory_events.id for easy joins.
-    tags_list = safe_json_loads(payload.get("tags_json", "[]"))
-    topic_id = (payload.get("topic_id") or "").strip().lower()
-    if topic_id and topic_id not in tags_list:
-        tags_list = [topic_id] + list(tags_list)
-    tags_for_fts = " ".join(tags_list)
-
-    cur.execute(
-        "INSERT INTO memory_events_fts(rowid, text, tags) VALUES (?, ?, ?)",
-        (mem_id, payload["text"], tags_for_fts),
-    )
-    conn.commit()
-    return mem_id
 
 def _mark_events_summarized_sync(conn: sqlite3.Connection, event_ids: list[int]) -> None:
-    if not event_ids:
-        return
-    cur = conn.cursor()
-    cur.execute(
-        f"UPDATE memory_events SET summarized = 1 WHERE id IN ({','.join(['?']*len(event_ids))})",
-        tuple(event_ids)
-    )
-    conn.commit()
+    mark_events_summarized_store(conn, event_ids)
 
 async def recall_profile_for_user(user_id: int, limit: int = 6) -> list[dict]:
     if not stage_at_least("M1"):
@@ -828,376 +656,65 @@ async def recall_profile_for_user(user_id: int, limit: int = 6) -> list[dict]:
         return await asyncio.to_thread(_search_memory_events_by_tag_sync, db_conn, tag, "profile", limit)
 
 def _search_memory_events_by_tag_sync(conn, subject_tag: str, kind_tag: str, limit: int) -> list[dict]:
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, created_at_utc, channel_name, author_name, text, tags_json, importance, topic_id
-        FROM memory_events
-        WHERE tags_json LIKE ? AND tags_json LIKE ?
-        ORDER BY created_ts DESC
-        LIMIT ?
-        """,
-        (f'%"{subject_tag}"%', f'%"{kind_tag}"%', int(limit)),
+    return search_memory_events_by_tag_store(
+        conn,
+        subject_tag,
+        kind_tag,
+        limit,
+        safe_json_loads=safe_json_loads,
     )
-    rows = cur.fetchall()
-    out = []
-    for r in rows:
-        out.append({
-            "id": r[0],
-            "created_at_utc": r[1],
-            "channel_name": r[2],
-            "author_name": r[3],
-            "text": r[4],
-            "tags": json.loads(r[5] or "[]"),
-            "importance": r[6],
-            "topic_id": r[7],
-        })
-    return out
 
 def _upsert_summary_sync(conn: sqlite3.Connection, payload: dict) -> int:
-    """Upsert by (topic_id). Keeps a single rolling summary per topic for now."""
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM memory_summaries WHERE topic_id = ? ORDER BY id DESC LIMIT 1", (payload["topic_id"],))
-    row = cur.fetchone()
-    if row:
-        sid = int(row[0])
-        cur.execute(
-            """
-            UPDATE memory_summaries
-            SET updated_at_utc=?, start_ts=?, end_ts=?, tags_json=?, importance=?, summary_text=?
-            WHERE id=?
-            """,
-            (
-                payload["updated_at_utc"],
-                payload.get("start_ts"),
-                payload.get("end_ts"),
-                payload.get("tags_json", "[]"),
-                int(payload.get("importance", 1)),
-                payload["summary_text"],
-                sid,
-            )
-        )
-    else:
-        cur.execute(
-            """
-            INSERT INTO memory_summaries (
-                topic_id, created_at_utc, updated_at_utc,
-                start_ts, end_ts, tags_json, importance, summary_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                payload["topic_id"],
-                payload["created_at_utc"],
-                payload["updated_at_utc"],
-                payload.get("start_ts"),
-                payload.get("end_ts"),
-                payload.get("tags_json", "[]"),
-                int(payload.get("importance", 1)),
-                payload["summary_text"],
-            )
-        )
-        sid = int(cur.lastrowid)
-
-    # Update FTS
-    tags_for_fts = " ".join(safe_json_loads(payload.get("tags_json", "[]")))
-    cur.execute("DELETE FROM memory_summaries_fts WHERE rowid = ?", (sid,))
-    cur.execute(
-        "INSERT INTO memory_summaries_fts(rowid, topic_id, summary_text, tags) VALUES (?, ?, ?, ?)",
-        (sid, payload["topic_id"], payload["summary_text"], tags_for_fts)
+    return upsert_summary_store(
+        conn,
+        payload,
+        safe_json_loads=safe_json_loads,
     )
-
-    conn.commit()
-    return sid
 
 def _search_memory_events_sync(conn: sqlite3.Connection, query: str, scope: str, limit: int = 8) -> list[dict]:
-    fts_q = build_fts_query(query)
-    if not fts_q:
-        return []
-
-    temporal_scope, guild_id, channel_id = parse_recall_scope(scope)
-
-    if temporal_scope == "hot":
-        allowed_tiers = (0,)
-    elif temporal_scope == "warm":
-        allowed_tiers = (0, 1)
-    elif temporal_scope == "cold":
-        allowed_tiers = (2,)
-    else:
-        allowed_tiers = (0, 1, 2, 3)
-
-
-    cur = conn.cursor()
-
-    # Pull a wider set, then apply our scoring in Python.
-    # IMPORTANT: apply allowed tiers at SQL level to reduce junk work.
-    tier_placeholders = ",".join("?" for _ in allowed_tiers)
-
-    cur.execute(
-        f"""
-        SELECT me.id, me.created_at_utc, me.created_ts,
-               me.channel_id, me.channel_name,
-               me.author_id, me.author_name,
-               me.source_message_id,
-               me.text, me.tags_json, me.importance, me.tier,
-               me.topic_id, me.topic_source, me.topic_confidence,
-
-               me.logged_from_channel_id, me.logged_from_channel_name, me.logged_from_message_id,
-               me.source_channel_id, me.source_channel_name,
-
-               bm25(memory_events_fts) as rank
-        FROM memory_events_fts
-        JOIN memory_events me ON me.id = memory_events_fts.rowid
-        WHERE memory_events_fts MATCH ?
-        AND me.tier IN ({tier_placeholders})
-        AND (? IS NULL OR me.channel_id = ?)
-        AND (? IS NULL OR me.guild_id = ?)
-        LIMIT 60
-
-        """,
-        (fts_q, *allowed_tiers, channel_id, channel_id, guild_id, guild_id),
+    return search_memory_events_store(
+        conn,
+        query,
+        scope,
+        limit=limit,
+        build_fts_query=build_fts_query,
+        parse_recall_scope=parse_recall_scope,
+        stage_at_least=stage_at_least,
+        safe_json_loads=safe_json_loads,
     )
-    rows = cur.fetchall()
-
-    scored: list[tuple[float, dict]] = []
-    now = int(time.time())
-
-    for (
-        mid, created_at_utc, created_ts,
-        channel_id, channel_name,
-        author_id, author_name,
-        source_message_id,
-        text, tags_json, importance, tier,
-        topic_id, topic_source, topic_confidence,
-        logged_from_channel_id, logged_from_channel_name, logged_from_message_id,
-        source_channel_id, source_channel_name,
-        rank,
-    ) in rows:
-
-        tier = int(tier or 1)
-        if tier not in allowed_tiers:
-            continue
-
-        importance = int(importance or 0)
-
-        # Stage-aware retention: ignore junk that's far past the ladder intent.
-        if stage_at_least("M1") and not stage_at_least("M2"):
-            # M1: drop normal memories older than 14d
-            if importance == 0 and (now - int(created_ts or 0)) > 14 * 86400:
-                continue
-        if stage_at_least("M2"):
-            # M2+: drop normal memories once they pass cold window
-            if importance == 0 and tier >= 3:
-                continue
-
-        base = -float(rank or 0.0)
-
-        if tier == 0:
-            recency_boost = 2.0
-        elif tier == 1:
-            recency_boost = 1.0
-        elif tier == 2:
-            recency_boost = 0.25
-        else:
-            recency_boost = 0.0
-
-        importance_boost = 2.0 if importance == 1 else 0.0
-        score = base + recency_boost + importance_boost
-
-        scored.append(
-            (
-                score,
-                {
-                    "id": int(mid),
-                    "created_at_utc": created_at_utc,
-                    "created_ts": int(created_ts or 0),
-
-                    # back-compat + utility
-                    "channel_id": channel_id,
-                    "channel_name": channel_name,
-                    "author_id": author_id,
-                    "author_name": author_name,
-                    "source_message_id": source_message_id,
-
-                    "text": text,
-                    "tags": safe_json_loads(tags_json),
-                    "importance": importance,
-                    "tier": tier,
-
-                    # topic metadata (previously fetched but discarded)
-                    "topic_id": topic_id,
-                    "topic_source": topic_source,
-                    "topic_confidence": topic_confidence,
-
-                    # provenance (new)
-                    "logged_from_channel_id": logged_from_channel_id,
-                    "logged_from_channel_name": logged_from_channel_name,
-                    "logged_from_message_id": logged_from_message_id,
-                    "source_channel_id": source_channel_id,
-                    "source_channel_name": source_channel_name,
-                },
-            )
-        )
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [d for _, d in scored[:limit]]
 
 def _search_memory_summaries_sync(conn: sqlite3.Connection, query: str, limit: int = 3) -> list[dict]:
-    fts_q = build_fts_query(query)
-    if not fts_q:
-        return []
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT ms.id, ms.topic_id, ms.updated_at_utc, ms.start_ts, ms.end_ts, ms.tags_json, ms.importance, ms.summary_text,
-               bm25(memory_summaries_fts) as rank
-        FROM memory_summaries_fts
-        JOIN memory_summaries ms ON ms.id = memory_summaries_fts.rowid
-        WHERE memory_summaries_fts MATCH ?
-        LIMIT 20
-        """,
-        (fts_q,)
+    return search_memory_summaries_store(
+        conn,
+        query,
+        limit=limit,
+        build_fts_query=build_fts_query,
+        safe_json_loads=safe_json_loads,
     )
-    rows = cur.fetchall()
-    out = []
-    for (sid, topic_id, updated_at_utc, start_ts, end_ts, tags_json, importance, summary_text, rank) in rows:
-        out.append({
-            "id": int(sid),
-            "topic_id": topic_id,
-            "updated_at_utc": updated_at_utc,
-            "start_ts": int(start_ts or 0),
-            "end_ts": int(end_ts or 0),
-            "tags": safe_json_loads(tags_json),
-            "importance": int(importance or 1),
-            "summary_text": summary_text,
-            "rank": float(rank or 0.0),
-        })
-    # Lower bm25 is better
-    out.sort(key=lambda d: d["rank"])
-    return out[:limit]
 
 def _cleanup_memory_sync(conn: sqlite3.Connection) -> tuple[int, int]:
-    """Returns (events_deleted, summaries_deleted)."""
-    cur = conn.cursor()
-    now = int(time.time())
-    events_deleted = 0
-    summaries_deleted = 0
-
-    # Refresh tiers based on current age (M2+ uses tiers heavily)
-    cur.execute(
-        """
-        UPDATE memory_events
-        SET tier = CASE
-            WHEN (? - created_ts) < 86400 THEN 0
-            WHEN (? - created_ts) < 14*86400 THEN 1
-            WHEN (? - created_ts) < 90*86400 THEN 2
-            ELSE 3
-        END
-        """,
-        (now, now, now)
-    )
-
-    if stage_at_least("M1") and not stage_at_least("M2"):
-        # M1 retention: normal memories only live 14d
-        cur.execute("DELETE FROM memory_events WHERE importance=0 AND created_ts < ?", (now - 14*86400,))
-        events_deleted += cur.rowcount
-    elif stage_at_least("M2"):
-        # M2+ retention: normal memories live through cold window (90d)
-        cur.execute("DELETE FROM memory_events WHERE importance=0 AND created_ts < ?", (now - 90*86400,))
-        events_deleted += cur.rowcount
-
-    # Prune orphaned FTS rows (safe, cheap enough at our scale)
-    cur.execute("DELETE FROM memory_events_fts WHERE rowid NOT IN (SELECT id FROM memory_events)")
-    cur.execute("DELETE FROM memory_summaries_fts WHERE rowid NOT IN (SELECT id FROM memory_summaries)")
-
-    conn.commit()
-    return events_deleted, summaries_deleted
+    return cleanup_memory_store(conn, stage_at_least=stage_at_least)
 def _fetch_topic_events_sync(conn: sqlite3.Connection, topic_id: str, min_age_days: int = 14, max_events: int = 200) -> list[dict]:
-    topic_id = (topic_id or "").strip().lower()
-    if not topic_id:
-        return []
-    cur = conn.cursor()
-    cutoff = int(time.time()) - int(min_age_days) * 86400
-    like_pat = f'%"{topic_id}"%'
-
-    cur.execute(
-        """
-        SELECT id, created_at_utc, created_ts, channel_name, author_name, text, tags_json
-        FROM memory_events
-        WHERE importance = 1
-          AND summarized = 0
-          AND created_ts < ?
-          AND (
-                (topic_id IS NOT NULL AND topic_id = ?)
-                OR (tags_json LIKE ?)
-              )
-        ORDER BY created_ts ASC
-        LIMIT ?
-        """,
-        (cutoff, topic_id, like_pat, int(max_events))
+    return fetch_topic_events_store(
+        conn,
+        topic_id,
+        min_age_days=min_age_days,
+        max_events=max_events,
+        safe_json_loads=safe_json_loads,
     )
-    rows = cur.fetchall()
-    out = []
-    for (eid, created_at_utc, created_ts, channel_name, author_name, text, tags_json) in rows:
-        out.append({
-            "id": int(eid),
-            "created_at_utc": created_at_utc,
-            "created_ts": int(created_ts or 0),
-            "channel_name": channel_name,
-            "author_name": author_name,
-            "text": text,
-            "tags": safe_json_loads(tags_json),
-        })
-    return out
 
 def _get_topic_summary_sync(conn: sqlite3.Connection, topic_id: str) -> dict | None:
-    topic_id = (topic_id or "").strip().lower()
-    if not topic_id:
-        return None
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, topic_id, updated_at_utc, start_ts, end_ts, tags_json, importance, summary_text
-        FROM memory_summaries
-        WHERE topic_id = ?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (topic_id,)
+    return get_topic_summary_store(
+        conn,
+        topic_id,
+        safe_json_loads=safe_json_loads,
     )
-    row = cur.fetchone()
-    if not row:
-        return None
-    sid, topic_id, updated_at_utc, start_ts, end_ts, tags_json, importance, summary_text = row
-    return {
-        "id": int(sid),
-        "topic_id": topic_id,
-        "updated_at_utc": updated_at_utc,
-        "start_ts": int(start_ts or 0),
-        "end_ts": int(end_ts or 0),
-        "tags": safe_json_loads(tags_json),
-        "importance": int(importance or 1),
-        "summary_text": summary_text,
-    }
 
 def _fetch_latest_memory_events_sync(
     conn: sqlite3.Connection,
     limit: int,
 ) -> list[tuple[str, str, str, str]]:
-    """
-    Returns newest-first list of (created_at_utc, author_name, channel_name, text)
-    """
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT created_at_utc, author_name, COALESCE(channel_name,''), text
-        FROM memory_events
-        WHERE text IS NOT NULL AND TRIM(text) != ''
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (int(limit),),
-    )
-    return cur.fetchall()
+    return fetch_latest_memory_events_store(conn, limit)
 
 
 def _fetch_memory_events_since_sync(
@@ -1205,118 +722,39 @@ def _fetch_memory_events_since_sync(
     since_iso_utc: str,
     limit: int,
 ) -> list[tuple[str, str, str, str]]:
-    """
-    Returns newest-first list of (created_at_utc, author_name, channel_name, text)
-    for memory_events with created_at_utc >= since_iso_utc.
-    """
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT created_at_utc, author_name, COALESCE(channel_name,''), text
-        FROM memory_events
-        WHERE created_at_utc >= ?
-          AND text IS NOT NULL AND TRIM(text) != ''
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (since_iso_utc, int(limit)),
-    )
-    return cur.fetchall()
+    return fetch_memory_events_since_store(conn, since_iso_utc, limit)
 
 def _format_memory_events_window(rows: list[tuple[str, str, str, str]], max_chars: int = 12000) -> str:
-    if not rows:
-        return "(no memory events)"
-    rows = list(reversed(rows))  # chronological
-    out_lines = []
-    total = 0
-    for created_at_utc, author_name, channel_name, text in rows:
-        ts = created_at_utc
-        if ts and "T" in ts:
-            try:
-                ts = ts.split("T", 1)[1][:5]
-            except Exception:
-                pass
-        ch = channel_name or "unknown-channel"
-        who = author_name or "unknown-author"
-        clean = " ".join((text or "").split())
-        line = f"[{ts}] {who} #{ch} :: {clean}"
-        if total + len(line) + 1 > max_chars:
-            break
-        out_lines.append(line)
-        total += len(line) + 1
-    return "\n".join(out_lines)
+    return format_memory_events_window_service(rows, max_chars=max_chars)
 
 def _fetch_last_messages_by_author_sync(conn, channel_id, before_message_id, author_name_like, limit=1):
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT created_at_utc, author_name, content
-        FROM messages
-        WHERE channel_id = ?
-          AND message_id < ?
-          AND author_name LIKE ?
-          AND content IS NOT NULL
-          AND TRIM(content) != ''
-        ORDER BY message_id DESC
-        LIMIT ?
-        """,
-        (channel_id, before_message_id, author_name_like, limit),
+    return fetch_last_messages_by_author_store(
+        conn,
+        channel_id,
+        before_message_id,
+        author_name_like,
+        limit=limit,
     )
-    return cur.fetchall()
 
 
 def _get_backfill_done_sync(conn: sqlite3.Connection, channel_id: int) -> tuple[bool, str | None]:
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT backfill_done, last_backfill_at_utc FROM channel_state WHERE channel_id = ? LIMIT 1",
-        (int(channel_id),),
-    )
-    row = cur.fetchone()
-    if not row:
-        return (False, None)
-    return (int(row[0]) == 1, row[1])
+    return get_backfill_done_store(conn, channel_id)
 
 
 def _set_backfill_done_sync(conn: sqlite3.Connection, channel_id: int, iso_utc: str) -> None:
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO channel_state (channel_id, backfill_done, last_backfill_at_utc)
-        VALUES (?, 1, ?)
-        ON CONFLICT(channel_id) DO UPDATE SET
-            backfill_done=1,
-            last_backfill_at_utc=excluded.last_backfill_at_utc
-        """,
-        (channel_id, iso_utc)
-    )
-    conn.commit()
+    set_backfill_done_store(conn, channel_id, iso_utc)
 
 BOOTSTRAP_CHANNEL_RESET_ALL = os.getenv("EPOXY_BOOTSTRAP_CHANNEL_RESET_ALL", "0").strip() == "1"
 
 def _reset_all_backfill_done_sync(conn: sqlite3.Connection) -> None:
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE channel_state SET backfill_done = 0, last_backfill_at_utc = NULL"
-    )
-    conn.commit()
+    reset_all_backfill_done_store(conn)
 
 async def reset_all_backfill_done() -> None:
     async with db_lock:
         await asyncio.to_thread(_reset_all_backfill_done_sync, db_conn)
 
 def _reset_backfill_done_sync(conn: sqlite3.Connection, channel_id: int) -> None:
-    cur = conn.cursor()
-    # If a row exists, flip the flag off and clear timestamp.
-    cur.execute(
-        """
-        UPDATE channel_state
-        SET backfill_done = 0,
-            last_backfill_at_utc = NULL
-        WHERE channel_id = ?
-        """,
-        (int(channel_id),),
-    )
-    conn.commit()
+    reset_backfill_done_store(conn, channel_id)
 
 async def reset_backfill_done(channel_id: int) -> None:
     async with db_lock:
@@ -1329,24 +767,7 @@ def _fetch_recent_context_sync(
     before_message_id: int,
     limit: int
 ) -> list[tuple[str, str, str]]:
-    """
-    Returns list of (created_at_utc, author_name, content), newest-first.
-    """
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT created_at_utc, author_name, content
-        FROM messages
-        WHERE channel_id = ?
-          AND message_id < ?
-          AND content IS NOT NULL
-          AND TRIM(content) != ''
-        ORDER BY message_id DESC
-        LIMIT ?
-        """,
-        (channel_id, before_message_id, limit)
-    )
-    return cur.fetchall()
+    return fetch_recent_context_store(conn, channel_id, before_message_id, limit)
 
 def _fetch_messages_since_sync(
     conn: sqlite3.Connection,
@@ -1354,114 +775,33 @@ def _fetch_messages_since_sync(
     since_iso_utc: str,
     limit: int,
 ) -> list[tuple[str, str, str]]:
-    """
-    Returns newest-first list of (created_at_utc, author_name, content)
-    for messages with created_at_utc >= since_iso_utc.
-    """
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT created_at_utc, author_name, content
-        FROM messages
-        WHERE channel_id = ?
-          AND created_at_utc >= ?
-          AND content IS NOT NULL
-          AND TRIM(content) != ''
-        ORDER BY message_id DESC
-        LIMIT ?
-        """,
-        (int(channel_id), since_iso_utc, int(limit)),
-    )
-    return cur.fetchall()
+    return fetch_messages_since_store(conn, channel_id, since_iso_utc, limit)
 
 def _parse_duration_to_minutes(token: str) -> int | None:
-    t = (token or "").strip().lower()
-    if t in {"hot", "--hot"}:
-        return 30  # default hot window
-    m = re.match(r"^(\d{1,3})\s*([mh])$", t)
-    if not m:
-        return None
-    n = int(m.group(1))
-    unit = m.group(2)
-    return n * 60 if unit == "h" else n
+    return parse_duration_to_minutes_service(token)
 
 def _format_recent_context(rows: list[tuple[str, str, str]], max_chars: int, max_line_chars: int) -> str:
-    """
-    rows expected newest-first; formats oldest->newest, truncating to max_chars.
-    """
-    if not rows:
-        return "(no recent context found)"
-
-    # Reverse to chronological
-    rows = list(reversed(rows))
-
-    lines: list[str] = []
-    total = 0
-
-    for created_at_utc, author_name, content in rows:
-        clean = " ".join((content or "").split())  # collapse whitespace/newlines
-
-        if len(clean) > max_line_chars:
-            # Preserve both head + tail so we keep the "what" and the "so what"
-            head_len = int(max_line_chars * 0.65)
-            tail_len = max_line_chars - head_len - 3
-            head = clean[:head_len].rstrip()
-            tail = clean[-tail_len:].lstrip() if tail_len > 0 else ""
-            clean = f"{head}…{tail}"
-
-        # Keep timestamp compact (ISO -> just time if present)
-        ts = created_at_utc
-        if "T" in created_at_utc:
-            # e.g. 2026-01-11T04:24:09.123456 -> 04:24
-            try:
-                ts = created_at_utc.split("T", 1)[1][:5]
-            except Exception:
-                ts = created_at_utc
-
-        line = f"[{ts}] {author_name}: {clean}"
-
-        if total + len(line) + 1 > max_chars:
-            break
-
-        lines.append(line)
-        total += len(line) + 1
-
-    return "\n".join(lines) if lines else "(context truncated to 0 lines)"
+    return format_recent_context_service(rows, max_chars, max_line_chars)
 
 async def get_recent_channel_context(channel_id: int, before_message_id: int) -> tuple[str, int]:
-    async with db_lock:
-        rows = await asyncio.to_thread(
-            _fetch_recent_context_sync,
-            db_conn,
-            channel_id,
-            before_message_id,
-            RECENT_CONTEXT_LIMIT
-        )
-    text = _format_recent_context(rows, RECENT_CONTEXT_MAX_CHARS, MAX_LINE_CHARS)
-    return text, len(rows)
+    return await get_recent_channel_context_service(
+        channel_id,
+        before_message_id,
+        db_lock=db_lock,
+        db_conn=db_conn,
+        fetch_recent_context_sync=_fetch_recent_context_sync,
+        recent_context_limit=RECENT_CONTEXT_LIMIT,
+        recent_context_max_chars=RECENT_CONTEXT_MAX_CHARS,
+        max_line_chars=MAX_LINE_CHARS,
+    )
+
 
 def _fetch_latest_messages_sync(
     conn: sqlite3.Connection,
     channel_id: int,
     limit: int,
 ) -> list[tuple[str, str, str]]:
-    """
-    Returns newest-first list of (created_at_utc, author_name, content).
-    """
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT created_at_utc, author_name, content
-        FROM messages
-        WHERE channel_id = ?
-          AND content IS NOT NULL
-          AND TRIM(content) != ''
-        ORDER BY message_id DESC
-        LIMIT ?
-        """,
-        (int(channel_id), int(limit)),
-    )
-    return cur.fetchall()
+    return fetch_latest_messages_store(conn, channel_id, limit)
 
 
 def _set_memory_origin_sync(
@@ -1470,17 +810,7 @@ def _set_memory_origin_sync(
     source_channel_id: int | None,
     source_channel_name: str | None,
 ) -> None:
-    cur = conn.cursor()
-    cur.execute(
-        """
-        UPDATE memory_events
-        SET source_channel_id = ?,
-            source_channel_name = ?
-        WHERE id = ?
-        """,
-        (source_channel_id, source_channel_name, int(mem_id)),
-    )
-    conn.commit()
+    set_memory_origin_store(conn, mem_id, source_channel_id, source_channel_name)
 
 
 async def set_memory_origin(mem_id: int, source_channel_id: int | None, source_channel_name: str | None) -> None:
@@ -1492,69 +822,24 @@ async def set_memory_origin(mem_id: int, source_channel_id: int | None, source_c
 # =========================
 
 def _list_known_topics_sync(conn: sqlite3.Connection, limit: int = 200) -> list[str]:
-    cur = conn.cursor()
-    topics = set()
-    try:
-        cur.execute("SELECT DISTINCT topic_id FROM memory_events WHERE topic_id IS NOT NULL AND topic_id != '' LIMIT ?", (int(limit),))
-        for (t,) in cur.fetchall():
-            if t:
-                topics.add(str(t).strip().lower())
-    except Exception:
-        pass
-    try:
-        cur.execute("SELECT DISTINCT topic_id FROM memory_summaries WHERE topic_id IS NOT NULL AND topic_id != '' LIMIT ?", (int(limit),))
-        for (t,) in cur.fetchall():
-            if t:
-                topics.add(str(t).strip().lower())
-    except Exception:
-        pass
-
-    # Only keep slug-ish ids
-    out = [t for t in topics if re.fullmatch(r"[a-z0-9_\-]{3,}", t)]
-    out.sort()
-    return out[: int(limit)]
+    return list_known_topics_store(conn, limit)
 
 
 def _topic_counts_sync(conn: sqlite3.Connection, limit: int = 15) -> list[tuple[str, int]]:
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            SELECT topic_id, COUNT(*) as n
-            FROM memory_events
-            WHERE topic_id IS NOT NULL AND topic_id != ''
-            GROUP BY topic_id
-            ORDER BY n DESC
-            LIMIT ?
-            """,
-            (int(limit),)
-        )
-        rows = cur.fetchall()
-        return [(str(t), int(n)) for (t, n) in rows if t]
-    except Exception:
-        return []
+    return topic_counts_store(conn, limit)
 
 
 async def _get_topic_candidates() -> list[str]:
-    """Return candidate topic_ids to choose from (allowlist preferred; else known topics)."""
-    if TOPIC_ALLOWLIST:
-        return list(TOPIC_ALLOWLIST)[:40]
-    async with db_lock:
-        known = await asyncio.to_thread(_list_known_topics_sync, db_conn, 200)
-    return list(known)[:40]
+    return await get_topic_candidates_service(
+        topic_allowlist=TOPIC_ALLOWLIST,
+        db_lock=db_lock,
+        db_conn=db_conn,
+        list_known_topics_sync=_list_known_topics_sync,
+    )
 
 
 def _safe_extract_json_obj(text: str) -> dict | None:
-    if not text:
-        return None
-    m = re.search(r"\{.*\}", text, flags=re.S)
-    if not m:
-        return None
-    try:
-        import json as _json
-        return _json.loads(m.group(0))
-    except Exception:
-        return None
+    return safe_extract_json_obj_service(text)
     
 def _parse_channel_id_token(token: str) -> int | None:
     token = (token or "").strip()
@@ -1572,114 +857,20 @@ def _parse_channel_id_token(token: str) -> int | None:
 
 
 def _extract_json_array(text: str) -> list[dict]:
-    """
-    Strict-ish: tries json.loads; if it fails, extracts the first [...] block and loads that.
-    """
-    import json
-
-    if not text:
-        return []
-    text = text.strip()
-
-    try:
-        data = json.loads(text)
-        return data if isinstance(data, list) else []
-    except Exception:
-        pass
-
-    # Try to salvage: find outermost [ ... ]
-    start = text.find("[")
-    end = text.rfind("]")
-    if start != -1 and end != -1 and end > start:
-        blob = text[start : end + 1]
-        try:
-            data = json.loads(blob)
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
-
-    return []
+    return extract_json_array_service(text)
 
 def _is_valid_topic_id(t: str) -> bool:
     return bool(re.match(r"^[a-z0-9_]{3,24}$", t or ""))
 
-def _extract_json_array(text: str) -> list[dict]:
-    if not text:
-        return []
-    text = text.strip()
-    try:
-        data = json.loads(text)
-        return data if isinstance(data, list) else []
-    except Exception:
-        pass
-
-    start = text.find("[")
-    end = text.rfind("]")
-    if start != -1 and end != -1 and end > start:
-        blob = text[start:end+1]
-        try:
-            data = json.loads(blob)
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
-    return []
-
 
 async def _suggest_topic_id(text: str, candidates: list[str]) -> tuple[str | None, float]:
-    """Suggest a topic_id from candidates. Returns (topic_id|None, confidence)."""
-    if not (TOPIC_SUGGEST and candidates):
-        return (None, 0.0)
-
-    snippet = " ".join((text or "").split())
-    if len(snippet) > 600:
-        snippet = snippet[:599] + "…"
-
-    cand_pack = ", ".join(candidates[:40])
-
-    sys = (
-        "You are a classifier that assigns a short memory snippet to ONE topic_id from a provided list.\n"
-        "Return JSON only with keys topic_id and confidence.\n"
-        "Rules:\n"
-        "- topic_id must be exactly one of the provided candidates, or null if none fit.\n"
-        "- confidence is a number from 0 to 1 representing certainty.\n"
-        "- Do not include any extra keys or any extra text.\n"
+    return await suggest_topic_id_service(
+        text,
+        candidates,
+        topic_suggest=TOPIC_SUGGEST,
+        client=client,
+        openai_model=OPENAI_MODEL,
     )
-
-    user = f"Candidates: {cand_pack}\n\nSnippet: {snippet}\n"
-
-    try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": sys[:1900]},
-                {"role": "user", "content": user[:1900]},
-            ],
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-    except Exception:
-        return (None, 0.0)
-
-    obj = _safe_extract_json_obj(raw)
-    if not isinstance(obj, dict):
-        return (None, 0.0)
-
-    topic = obj.get("topic_id")
-    conf = obj.get("confidence")
-    try:
-        conf_f = float(conf)
-    except Exception:
-        conf_f = 0.0
-
-    if topic is None:
-        return (None, max(0.0, min(1.0, conf_f)))
-
-    topic = str(topic).strip().lower()
-    cand_set = set([t.lower() for t in candidates])
-    if topic not in cand_set:
-        return (None, 0.0)
-
-    conf_f = max(0.0, min(1.0, conf_f))
-    return (topic, conf_f)
 
 
 async def remember_event(
@@ -1690,474 +881,95 @@ async def remember_event(
     message: discord.Message | None = None,
     topic_hint: str | None = None,
 ) -> dict | None:
-    if not stage_at_least("M1"):
-        return None
-
-    tags = normalize_tags(tags or [])
-
-    # Explicit topic wins (manual)
-    topic_id: str | None = None
-    if topic_hint:
-        hinted = normalize_tags([topic_hint])
-        topic_id = hinted[0] if hinted else None
-
-    # Otherwise, derive from tags: first non-kind tag.
-    if not topic_id and tags:
-        for t in tags:
-            if t and t not in RESERVED_KIND_TAGS:
-                topic_id = t
-                break
-
-    topic_source = "manual" if topic_id else "none"
-    topic_confidence: float | None = None
-
-    # If still no topic, optionally suggest one from allowlist/known topics.
-    if not topic_id and TOPIC_SUGGEST:
-        candidates = await _get_topic_candidates()
-        sug, conf = await _suggest_topic_id(text, candidates)
-        if sug and conf >= TOPIC_MIN_CONF:
-            topic_id = sug
-            topic_source = "suggested"
-            topic_confidence = conf
-            if topic_id not in tags:
-                tags = [topic_id] + tags
-
-    # Always keep kind tags (decision/policy/canon) if present.
-    tags = normalize_tags(tags)
-
-    created_dt = None
-    guild_id = None
-    channel_id = None
-    channel_name = None
-    author_id = None
-    author_name = None
-    source_message_id = None
-    logged_from_channel_id = None
-    logged_from_channel_name = None
-    logged_from_message_id = None
-
-    source_channel_id = None
-    source_channel_name = None
-
-    if message is not None:
-        created_dt = message.created_at if message.created_at else None
-        guild_id = message.guild.id if message.guild else None
-
-        # Where the memory was captured (command / auto-capture)
-        logged_from_channel_id = message.channel.id
-        logged_from_channel_name = getattr(message.channel, "name", str(message.channel))
-        logged_from_message_id = message.id
-
-        # Backward compatible fields (keep for now)
-        channel_id = message.channel.id
-        channel_name = getattr(message.channel, "name", str(message.channel))
-        source_message_id = message.id
-
-        author_id = message.author.id
-        author_name = str(message.author)
-
-        # If you don't yet support origin overrides, default origin to "unknown"
-        # (or set it equal to logged_from if you prefer).
-        source_channel_id = None
-        source_channel_name = None
-
-    created_ts = utc_ts(created_dt) if created_dt else utc_ts()
-    tier = infer_tier(created_ts) if stage_at_least("M2") else 1
-
-    payload = {
-        "created_at_utc": utc_iso(created_dt) if created_dt else utc_iso(),
-        "created_ts": created_ts,
-        "guild_id": guild_id,
-
-        # Backward compatibility
-        "channel_id": channel_id,
-        "channel_name": channel_name,
-        "source_message_id": source_message_id,
-
-        # New provenance
-        "logged_from_channel_id": logged_from_channel_id,
-        "logged_from_channel_name": logged_from_channel_name,
-        "logged_from_message_id": logged_from_message_id,
-        "source_channel_id": source_channel_id,
-        "source_channel_name": source_channel_name,
-
-        "author_id": author_id,
-        "author_name": author_name,
-        "text": (text or "").strip(),
-        "tags_json": safe_json_dumps(tags),
-        "importance": int(1 if importance else 0),
-        "tier": int(tier),
-        "topic_id": topic_id,
-        "topic_source": topic_source,
-        "topic_confidence": topic_confidence,
-        "summarized": 0,
-    }
-
-    if not payload["text"]:
-        return None
-
-    async with db_lock:
-        mem_id = await asyncio.to_thread(_insert_memory_event_sync, db_conn, payload)
-
-    return {
-        "id": int(mem_id),
-        "topic_id": topic_id,
-        "topic_source": topic_source,
-        "topic_confidence": topic_confidence,
-        "tags": tags,
-    }
+    return await remember_event_service(
+        text=text,
+        tags=tags,
+        importance=importance,
+        message=message,
+        topic_hint=topic_hint,
+        stage_at_least=stage_at_least,
+        normalize_tags=normalize_tags,
+        reserved_kind_tags=RESERVED_KIND_TAGS,
+        topic_suggest=TOPIC_SUGGEST,
+        topic_min_conf=TOPIC_MIN_CONF,
+        topic_allowlist=TOPIC_ALLOWLIST,
+        db_lock=db_lock,
+        db_conn=db_conn,
+        list_known_topics_sync=_list_known_topics_sync,
+        client=client,
+        openai_model=OPENAI_MODEL,
+        utc_iso=utc_iso,
+        utc_ts=utc_ts,
+        infer_tier=infer_tier,
+        safe_json_dumps=safe_json_dumps,
+        insert_memory_event_sync=_insert_memory_event_sync,
+    )
 
 def _budget_and_diversify_events(events: list[dict], scope: str, limit: int = 8) -> list[dict]:
-    """
-    Apply simple budgets to reduce near-duplicates and keep a healthy mix.
-
-    Deterministic (stable for a given input ordering) so you can test retrieval behavior.
-    Enforces tier budgets (hot/warm/cold) in M2+ to prevent cold-memory bleed.
-    """
-    if not events or int(limit or 0) <= 0:
-        return []
-
-    limit = int(limit)
-
-    # Heuristics: keep variety across topic/channel/author while preserving relevance ordering.
-    topic_cap = 3
-    channel_cap = 4
-    author_cap = 3
-
-    # If the user explicitly scoped to a single channel or guild, don't waste budget on that axis.
-    # Accept both old ("channel:") and tokenized scopes ("hot channel:123").
-    s = (scope or "").strip().lower()
-    if ("channel:" in s) or ("guild:" in s):
-        channel_cap = limit
-
-    # Tier budgets (0=hot, 1=warm, 2=cold, 3=archive).
-    # Default tuned for limit=8 -> 4 hot / 3 warm / 1 cold.
-    def _tier_caps(n: int) -> dict[int, int]:
-        n = max(1, int(n))
-        if n <= 3:
-            return {0: n, 1: 0, 2: 0, 3: 0}
-
-        hot = max(1, int(round(n * 0.50)))
-        warm = max(0, int(round(n * 0.375)))
-        cold = max(0, n - hot - warm)
-
-        # Fix rounding drift deterministically.
-        while hot + warm + cold < n:
-            warm += 1
-        while hot + warm + cold > n:
-            if warm > 0:
-                warm -= 1
-            elif hot > 1:
-                hot -= 1
-            else:
-                cold = max(0, cold - 1)
-
-        return {0: hot, 1: warm, 2: cold, 3: 0}
-
-    caps = _tier_caps(limit) if stage_at_least("M2") else {0: limit, 1: limit, 2: limit, 3: limit}
-    tier_counts: dict[int, int] = {}
-
-    def _fp(e: dict) -> str:
-        # Events use "text"; keep fallback to "content" for older rows/paths.
-        txt = (e.get("text") or e.get("content") or "").strip().lower()
-        txt = re.sub(r"\s+", " ", txt)
-        return hashlib.sha1(txt.encode("utf-8")).hexdigest()
-
-    seen: set[str] = set()
-    topic_counts: dict[str, int] = {}
-    channel_counts: dict[str, int] = {}
-    author_counts: dict[str, int] = {}
-
-    out: list[dict] = []
-    for e in events:
-        tier = int(e.get("tier") if e.get("tier") is not None else 1)
-
-        # In M2+, archive is generally noise for recall unless you explicitly fetch it.
-        if stage_at_least("M2") and tier >= 3:
-            continue
-
-        # Enforce tier budget (only meaningful in M2+).
-        if stage_at_least("M2"):
-            if tier_counts.get(tier, 0) >= caps.get(tier, 0):
-                continue
-
-        fp = _fp(e)
-        if fp in seen:
-            continue
-        seen.add(fp)
-
-        t = (e.get("topic_id") or "").strip()
-        c = str(e.get("channel_id") or "")
-        a = str(e.get("author_id") or "")
-
-        if t and topic_counts.get(t, 0) >= topic_cap:
-            continue
-        if c and channel_counts.get(c, 0) >= channel_cap:
-            continue
-        if a and author_counts.get(a, 0) >= author_cap:
-            continue
-
-        out.append(e)
-
-        if stage_at_least("M2"):
-            tier_counts[tier] = tier_counts.get(tier, 0) + 1
-        if t:
-            topic_counts[t] = topic_counts.get(t, 0) + 1
-        if c:
-            channel_counts[c] = channel_counts.get(c, 0) + 1
-        if a:
-            author_counts[a] = author_counts.get(a, 0) + 1
-
-        if len(out) >= limit:
-            break
-
-    return out
+    return retrieval_budget_and_diversify_events(
+        events,
+        scope,
+        stage_at_least=stage_at_least,
+        limit=limit,
+    )
 
 async def recall_memory(prompt: str, scope: str | None = None) -> tuple[list[dict], list[dict]]:
-    if not stage_at_least("M1"):
-        return ([], [])
-    scope = (scope or ("auto" if stage_at_least("M2") else "auto"))
-    async with db_lock:
-        events = await asyncio.to_thread(_search_memory_events_sync, db_conn, prompt, scope, 40)
-        events = _budget_and_diversify_events(events, scope, limit=8)
-        summaries = []
-        if stage_at_least("M3"):
-            summaries = await asyncio.to_thread(_search_memory_summaries_sync, db_conn, prompt, 3)
-    return (events, summaries)
+    return await recall_memory_service(
+        prompt,
+        scope,
+        stage_at_least=stage_at_least,
+        db_lock=db_lock,
+        db_conn=db_conn,
+        search_memory_events_sync=_search_memory_events_sync,
+        search_memory_summaries_sync=_search_memory_summaries_sync,
+    )
 
 def format_memory_for_llm(events: list[dict], summaries: list[dict], max_chars: int = 1700) -> str:
-    if not events and not summaries:
-        return "(no relevant persistent memory found)"
-
-    lines: list[str] = []
-
-    if summaries:
-        lines.append("Topic summaries:")
-        for s in summaries:
-            meta = f"[topic={s['topic_id']}] updated={s.get('updated_at_utc','')}"
-            lines.append(f"- {meta}\n  {s['summary_text'].strip()}")
-        lines.append("")
-
-    if events:
-        lines.append("Event memories:")
-        for e in events:
-            tags = ",".join(e.get("tags") or [])
-
-            when = e.get("created_at_utc") or "unknown-date"
-            ch = e.get("channel_name") or "unknown-channel"
-            who = e.get("author_name") or "unknown-author"
-            imp = "!" if int(e.get("importance") or 0) == 1 else ""
-
-            topic = (e.get("topic_id") or "")
-            topic_meta = f"topic={topic} " if topic else ""
-
-            # --- Provenance (explicit; never guess) ---
-            # logged_from = where Epoxy captured the memory (command/auto-capture channel)
-            logged_from_ch = e.get("logged_from_channel_name") or e.get("channel_name") or "unknown-channel"
-            logged_from_id = e.get("logged_from_channel_id") or e.get("channel_id")
-            logged_from = f"#{logged_from_ch}" if logged_from_ch else "unknown-channel"
-            if logged_from_id:
-                logged_from = f"{logged_from}({logged_from_id})"
-
-            # origin = where the underlying idea/message originally occurred (if tracked separately)
-            origin_ch = e.get("source_channel_name")
-            origin_id = e.get("source_channel_id")
-            if origin_ch or origin_id:
-                origin = f"#{origin_ch or 'unknown-channel'}"
-                if origin_id:
-                    origin = f"{origin}({origin_id})"
-            else:
-                origin = "unknown"
-
-            src_msg = e.get("source_message_id")
-            src_meta = f" msg={src_msg}" if src_msg else ""
-
-            prov = f"prov=logged_from:{logged_from} origin:{origin}{src_meta} "
-
-            text = (e.get("text") or "").strip()
-
-            lines.append(
-                f"- [{when}] {imp}{who} {prov}{topic_meta}tags=[{tags}] :: {text}"
-            )
-
-    out = "\n".join(lines).strip()
-    return out[:max_chars] if len(out) > max_chars else out
+    return format_memory_for_llm_service(events, summaries, max_chars=max_chars)
 
 def format_profile_for_llm(user_blocks: list[tuple[int, str, list[dict]]], max_chars: int = 900) -> str:
-    """
-    user_blocks: [(user_id, display_name, events), ...]
-    """
-    if not user_blocks:
-        return ""
-
-    lines: list[str] = ["Profile notes (curated):"]
-    for user_id, display_name, events in user_blocks:
-        if not events:
-            continue
-        lines.append(f"- <@{user_id}> ({display_name}):")
-        for e in events:
-            when = e.get("created_at_utc") or "unknown-date"
-            who = e.get("author_name") or "unknown-author"
-            ch = e.get("channel_name") or "unknown-channel"
-            txt = (e.get("text") or "").strip()
-            if txt:
-                lines.append(f"  • [{when}] {who} #{ch} :: {txt}")
-        lines.append("")
-
-    out = "\n".join(lines).strip()
-    return out[:max_chars] if len(out) > max_chars else out
+    return format_profile_for_llm_service(user_blocks, max_chars=max_chars)
 
 async def summarize_topic(topic_id: str, *, min_age_days: int = 14) -> str:
-    """
-    M3: consolidate important (importance=1) events for a topic into a rolling summary.
-    Topic is currently: a tag string (e.g. 'baseline_week').
-    """
-    if not stage_at_least("M3"):
-        return "Memory stage is not M3; summaries are disabled."
-
-    topic_id = (topic_id or "").strip().lower()
-    if not topic_id:
-        return "Missing topic_id."
-
-    async with db_lock:
-        existing = await asyncio.to_thread(_get_topic_summary_sync, db_conn, topic_id)
-        events = await asyncio.to_thread(_fetch_topic_events_sync, db_conn, topic_id, min_age_days, 200)
-
-    if not events:
-        if existing:
-            return existing["summary_text"]
-        return f"No eligible events to summarize for topic '{topic_id}'."
-
-    # Build a compact source pack.
-    # Keep the job stable: avoid giant prompts; we want durable gists, not exhaustive logs.
-    lines = []
-    for e in events:
-        when = e.get("created_at_utc") or ""
-        who = e.get("author_name") or ""
-        txt = " ".join((e.get("text") or "").split())
-        if len(txt) > 260:
-            txt = txt[:259] + "…"
-        lines.append(f"[{when}] {who}: {txt}")
-    source_pack = "\\n".join(lines)
-    if len(source_pack) > 6500:
-        source_pack = source_pack[:6500] + "\\n…(truncated)"
-
-    prior = existing["summary_text"] if existing else ""
-
-    sys = (
-        "You are Epoxy's memory consolidator.\\n"
-        "Your job: produce a compact, staff-usable topic summary from the event snippets.\\n"
-        "Rules:\\n"
-        "- Output 3–8 bullet points.\\n"
-        "- Prefer decisions, constraints, and stable takeaways.\\n"
-        "- Do NOT invent facts. If uncertain, say so.\\n"
-        "- Keep it concise and operational.\\n"
+    return await summarize_topic_service(
+        topic_id,
+        min_age_days=min_age_days,
+        stage_at_least=stage_at_least,
+        db_lock=db_lock,
+        db_conn=db_conn,
+        get_topic_summary_sync=_get_topic_summary_sync,
+        fetch_topic_events_sync=_fetch_topic_events_sync,
+        client=client,
+        openai_model=OPENAI_MODEL,
+        normalize_tags=normalize_tags,
+        utc_iso=utc_iso,
+        safe_json_dumps=safe_json_dumps,
+        upsert_summary_sync=_upsert_summary_sync,
+        mark_events_summarized_sync=_mark_events_summarized_sync,
     )
-
-    user = (
-        f"Topic: {topic_id}\\n\\n"
-        f"Existing summary (may be empty):\\n{prior}\\n\\n"
-        f"New event snippets to incorporate (chronological):\\n{source_pack}\\n\\n"
-        "Return only the updated bullet summary."
-    )
-
-    try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": sys[:1900]},
-                {"role": "user", "content": user[:1900]},
-            ],
-        )
-        summary_text = (resp.choices[0].message.content or "").strip()
-        if not summary_text:
-            return "Summarizer returned empty output."
-    except Exception as e:
-        return f"Summarizer error: {e}"
-
-    # Upsert + mark summarized
-    start_ts = min(e["created_ts"] for e in events)
-    end_ts = max(e["created_ts"] for e in events)
-    tags = normalize_tags([topic_id])
-
-    payload = {
-        "topic_id": topic_id,
-        "created_at_utc": utc_iso(),
-        "updated_at_utc": utc_iso(),
-        "start_ts": int(start_ts),
-        "end_ts": int(end_ts),
-        "tags_json": safe_json_dumps(tags),
-        "importance": 1,
-        "summary_text": summary_text,
-    }
-    event_ids = [e["id"] for e in events]
-
-    async with db_lock:
-        await asyncio.to_thread(_upsert_summary_sync, db_conn, payload)
-        await asyncio.to_thread(_mark_events_summarized_sync, db_conn, event_ids)
-
-    return summary_text
 
 async def maintenance_loop() -> None:
-    """Periodic cleanup + optional auto-summary."""
-    if not stage_at_least("M1"):
-        return
-
     interval = int(os.getenv("EPOXY_MAINTENANCE_INTERVAL_SECONDS", "3600"))
     min_age_days = int(os.getenv("EPOXY_SUMMARY_MIN_AGE_DAYS", "14"))
-
-    while True:
-        try:
-            async with db_lock:
-                deleted_events, _ = await asyncio.to_thread(_cleanup_memory_sync, db_conn)
-            if deleted_events:
-                print(f"[Memory] cleanup deleted_events={deleted_events} stage={MEMORY_STAGE}")
-
-            if AUTO_SUMMARY and stage_at_least("M3"):
-                # Very light auto-summary: summarize a couple topics per run based on unsummarized events.
-                cutoff = int(time.time()) - min_age_days * 86400
-                async with db_lock:
-                    # Count topics based on topic_id for a bounded set.
-                    rows = await asyncio.to_thread(
-                        lambda c: c.execute(
-                            "SELECT topic_id, COUNT(*) as n FROM memory_events WHERE importance=1 AND summarized=0 AND created_ts < ? AND topic_id IS NOT NULL AND topic_id != '' GROUP BY topic_id ORDER BY n DESC LIMIT 2",
-                            (cutoff,)
-                        ).fetchall(),
-                        db_conn
-                    )
-                topics = [(t, int(n)) for (t, n) in rows if t]
-
-                for topic_id, n in topics:
-                    print(f"[Memory] auto-summarizing topic={topic_id} events={n}")
-                    _ = await summarize_topic(topic_id, min_age_days=min_age_days)
-
-        except Exception as e:
-            print(f"[Memory] maintenance loop error: {e}")
-
-        await asyncio.sleep(max(60, interval))
+    return await maintenance_loop_service(
+        stage_at_least=stage_at_least,
+        db_lock=db_lock,
+        db_conn=db_conn,
+        cleanup_memory_sync=_cleanup_memory_sync,
+        auto_summary=AUTO_SUMMARY,
+        memory_stage=MEMORY_STAGE,
+        summarize_topic_func=summarize_topic,
+        interval_seconds=interval,
+        min_age_days=min_age_days,
+    )
 
 async def log_message(message: discord.Message) -> None:
-    attachments = ""
-    if message.attachments:
-        attachments = " | ".join(a.url for a in message.attachments if a.url)
-
-    guild = message.guild
-    payload = {
-        "message_id": message.id,
-        "guild_id": guild.id if guild else None,
-        "guild_name": guild.name if guild else None,
-        "channel_id": message.channel.id,
-        "channel_name": getattr(message.channel, "name", str(message.channel)),
-        "author_id": message.author.id,
-        "author_name": str(message.author),
-        "created_at_utc": message.created_at.isoformat() if message.created_at else "",
-        "content": message.content or "",
-        "attachments": attachments,
-    }
-
-    async with db_lock:
-        # run sync sqlite write off the event loop
-        await asyncio.to_thread(_insert_message_sync, db_conn, payload)
+    return await log_message_service(
+        message,
+        db_lock=db_lock,
+        db_conn=db_conn,
+        insert_message_sync=_insert_message_sync,
+    )
 
 async def is_backfill_done(channel_id: int) -> bool:
     async with db_lock:
@@ -2177,1150 +989,141 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-class WelcomePanel(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-        # 🔷 Link button: Get full access (no callback needed)
-        self.add_item(
-            discord.ui.Button(
-                label="Get full access",
-                emoji="🔷",
-                style=discord.ButtonStyle.link,
-                url=FULL_ACCESS_URL,
-            )
-        )
-
-
-    @discord.ui.button(
-        label="Access the server",
-        emoji="🔶",
-        style=discord.ButtonStyle.secondary,
-        custom_id="welcome_access"
-    )
-    async def access_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        if guild is None:
-            return
-
-        role = find_role_by_keyword(guild, ACCESS_ROLE_KEYWORD)
-        if role is None:
-            await interaction.response.send_message(
-                "I can't find the access role. Ask Brian to fix my config.",
-                ephemeral=True,
-            )
-            return
-
-        member = interaction.user
-        if not isinstance(member, discord.Member):
-            await interaction.response.send_message(
-                "This only works inside the server.",
-                ephemeral=True,
-            )
-            return
-
-        if role in member.roles:
-            await member.remove_roles(role, reason="Welcome panel: remove access")
-            await interaction.response.send_message(
-                "Access role removed. Your view will be limited again.",
-                ephemeral=True,
-            )
-        else:
-            await member.add_roles(role, reason="Welcome panel: grant access")
-            await interaction.response.send_message(
-                "Access granted. ✅\n\n"
-                "Hi, I'm **Epoxy** – the little brain running in the background of Lumeris.\n"
-                "I'm still under heavy development, but my job is to help you learn faster, "
-                "find good practice, and make this place easier to navigate.\n\n"
-                "For now, your access role is set and more channels should have just unlocked.\n"
-                "Over time, I'll learn to do things like:\n"
-                "- surface useful resources for whatever you're working on\n"
-                "- help schedule and ping practice groups\n"
-                "- give you smart feedback based on your sessions and questions\n\n"
-                "If you get lost or need help, just ask - our community tends to be happy to help.\n"
-                "Soon, you'll be able to ask me questions, too. I just need to get a little smarter first. \n"
-                "Welcome in, and I'm looking forward to working with you soon!🧠✨",
-                ephemeral=True,
-            )
-
-    @discord.ui.button(
-        label="Driving Pings",
-        emoji="🏎️",   # or "🎮" / "🕹️"
-        style=discord.ButtonStyle.secondary,
-        custom_id="welcome_driving"
-    )
-    async def driving_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        if guild is None:
-            return
-
-        role = find_role_by_keyword(guild, DRIVING_ROLE_KEYWORD)
-        if role is None:
-            await interaction.response.send_message(
-                "I can't find the Driving Ping role. Ask Brian to fix my config.",
-                ephemeral=True,
-            )
-            return
-
-        member = interaction.user
-        if not isinstance(member, discord.Member):
-            await interaction.response.send_message(
-                "This only works inside the server.",
-                ephemeral=True,
-            )
-            return
-
-        if role in member.roles:
-            await member.remove_roles(role, reason="Welcome panel: disable driving pings")
-            await interaction.response.send_message(
-                "Driving Pings disabled. You won't get race notifications.",
-                ephemeral=True,
-            )
-        else:
-            await member.add_roles(role, reason="Welcome panel: enable driving pings")
-            await interaction.response.send_message(
-                "Driving Pings enabled.",
-                ephemeral=True,
-            )
-
-@bot.event
-async def on_ready():
-    # Register persistent view so existing welcome-panel buttons keep working
-    bot.add_view(WelcomePanel())
-
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print("------")
-
 # =========================
 # COMMANDS (staff tooling)
 # =========================
-def _in_allowed_channel(ctx: commands.Context) -> bool:
-    try:
-        return int(ctx.channel.id) in ALLOWED_CHANNEL_IDS
-    except Exception:
-        return False
-    
-@bot.command(name="setup_welcome_panel")
-@commands.has_permissions(administrator=True)
-@commands.guild_only()
-async def setup_welcome_panel(ctx: commands.Context):
-    """One-time command to post the welcome / role panel."""
-    if ctx.channel.id != WELCOME_CHANNEL_ID:
-        await ctx.reply(
-            "Run this in the designated welcome channel.",
-            mention_author=False,
-        )
-        return
-
-    embed = discord.Embed(
-        title="Welcome to Lumeris",
-        description=(
-            "🔶 **Access the server**\n"
-            "Unlock the main community channels once you're ready to look around.\n\n"
-            "🔷 **Get full access**\n"
-            "Opens our external page where you can become a full Lumeris member.\n\n"
-            "🏎️ **Driving pings**\n"
-            "Opt in to casual race notifications when members are looking for a group."
-        ),
-        colour=discord.Colour.orange(),
-    )
-
-    view = WelcomePanel()
-    await ctx.send(embed=embed, view=view)
-    await ctx.reply("Welcome panel posted.", mention_author=False)
-
-
-@bot.command(name="memstage")
-async def memstage(ctx: commands.Context):
-    if not _in_allowed_channel(ctx):
-        return
-    await ctx.send(
-        f"Memory stage: **{MEMORY_STAGE}** (rank={MEMORY_STAGE_RANK}) | "
-        f"AUTO_CAPTURE={'1' if AUTO_CAPTURE else '0'} | AUTO_SUMMARY={'1' if AUTO_SUMMARY else '0'}"
-    )
-
-@bot.command(name="topics")
-async def topics_cmd(ctx: commands.Context, limit: int = 15):
-    """List known topics and/or the configured allowlist."""
-    if not _in_allowed_channel(ctx):
-        return
-    lim = max(1, min(int(limit or 15), 30))
-
-    allow = TOPIC_ALLOWLIST
-    async with db_lock:
-        counts = await asyncio.to_thread(_topic_counts_sync, db_conn, lim)
-        known = await asyncio.to_thread(_list_known_topics_sync, db_conn, 200)
-
-    lines = []
-    lines.append(f"TOPIC_SUGGEST={'1' if TOPIC_SUGGEST else '0'} | TOPIC_MIN_CONF={TOPIC_MIN_CONF:.2f}")
-    if allow:
-        lines.append(f"Allowlist ({len(allow)}): {', '.join(allow[:40])}")
-    else:
-        lines.append("Allowlist: (empty) — suggestions will use known topics only")
-
-    if counts:
-        lines.append("")
-        lines.append("Top topics by count:")
-        for t, n in counts:
-            lines.append(f"- {t}: {n}")
-    else:
-        lines.append("")
-        lines.append("No topic counts yet.")
-
-    if (not allow) and known:
-        lines.append("")
-        lines.append(f"Known topics ({len(known)}): {', '.join(known[:40])}")
-
-    body = "\n".join(lines)
-    await send_chunked(ctx.channel, f"```\n{body[:1700]}\n```")
-
-@bot.command(name="remember")
-async def remember_cmd(ctx: commands.Context, *, arg: str = ""):
-    """
-    Manual memory capture. Examples:
-      !remember baseline_week,decision | We will run Baseline Week on Feb 1.
-      !remember tags=baseline_week,decision importance=1 text=We will ...
-      !remember This is important to keep.
-    """
-    if not _in_allowed_channel(ctx):
-        return
-    if not stage_at_least("M1"):
-        await ctx.send("Memory stage is M0; set EPOXY_MEMORY_STAGE=M1+ to enable persistent memory.")
-        return
-
-    raw = (arg or "").strip()
-    if not raw:
-        await ctx.send("Usage: `!remember <tags> | <text>`  or  `!remember <text>`")
-        return
-
-    importance = 1  # explicit remember = important by default
-    tags: list[str] = []
-    text = raw
-
-    # Key=val format
-    if "tags=" in raw or "importance=" in raw or "text=" in raw:
-        m_tags = re.search(r"tags=([^\s]+)", raw)
-        m_imp = re.search(r"importance=([01])", raw)
-        m_text = re.search(r"text=(.+)$", raw)
-        if m_tags:
-            tags = re.split(r"[;,]+", m_tags.group(1))
-        if m_imp:
-            importance = int(m_imp.group(1))
-        if m_text:
-            text = m_text.group(1).strip()
-    elif "|" in raw:
-        left, right = raw.split("|", 1)
-        tags = re.split(r"[,\s]+", left.strip())
-        text = right.strip()
-
-    tags = normalize_tags(tags)
-    saved = await remember_event(text=text, tags=tags, importance=importance, message=ctx.message)
-    if not saved:
-        await ctx.send("Nothing saved (empty text).")
-        return
-    mem_id = saved.get('id')
-    topic_id = saved.get('topic_id')
-    topic_source = saved.get('topic_source')
-    conf = saved.get('topic_confidence')
-    conf_txt = f" conf={conf:.2f}" if isinstance(conf, float) else ""
-    topic_txt = f" topic={topic_id} ({topic_source}{conf_txt})" if topic_id else " topic=(none)"
-    await ctx.send(f"Saved memory #{mem_id} tags={tags} importance={importance}{topic_txt} 🧴")
-
-@bot.command(name="recall")
-async def recall_cmd(ctx: commands.Context, *, query: str = ""):
-    """Quick memory recall without calling the LLM."""
-    if not _in_allowed_channel(ctx):
-        return
-    if not stage_at_least("M1"):
-        await ctx.send("Memory stage is M0; nothing to recall yet.")
-        return
-
-    q = (query or "").strip()
-    if not q:
-        await ctx.send("Usage: `!recall <query>`")
-        return
-
-    scope = infer_scope(q) if stage_at_least("M2") else "auto"
-    events, summaries = await recall_memory(q, scope=scope)
-
-    pack = format_memory_for_llm(events, summaries, max_chars=1700)
-    await send_chunked(ctx.channel, f"```\\n{pack}\\n```")
-
-@bot.command(name="topic")
-async def topic_cmd(ctx: commands.Context, topic_id: str = ""):
-    """Show the current rolling summary for a topic."""
-    if not _in_allowed_channel(ctx):
-        return
-    if not stage_at_least("M3"):
-        await ctx.send("Memory stage is not M3; topic summaries are disabled.")
-        return
-    topic_id = (topic_id or "").strip().lower()
-    if not topic_id:
-        await ctx.send("Usage: `!topic <topic_id>`")
-        return
-
-    async with db_lock:
-        s = await asyncio.to_thread(_get_topic_summary_sync, db_conn, topic_id)
-    if not s:
-        await ctx.send(f"No summary found for topic '{topic_id}'.")
-        return
-
-    pack = f"[topic={s['topic_id']}] updated={s.get('updated_at_utc','')}\\n{s['summary_text']}"
-    await send_chunked(ctx.channel, f"```\\n{pack[:1700]}\\n```")
-
-@bot.command(name="summarize")
-async def summarize_cmd(ctx: commands.Context, topic_id: str = "", min_age_days: int = 14):
-    """Run M3 consolidation for a topic."""
-    if not _in_allowed_channel(ctx):
-        return
-    if not stage_at_least("M3"):
-        await ctx.send("Memory stage is not M3; summaries are disabled.")
-        return
-    topic_id = (topic_id or "").strip().lower()
-    if not topic_id:
-        await ctx.send("Usage: `!summarize <topic_id> [min_age_days]`")
-        return
-
-    await ctx.send(f"Summarizing topic **{topic_id}** (min_age_days={min_age_days})…")
-    out = await summarize_topic(topic_id, min_age_days=min_age_days)
-    await send_chunked(ctx.channel, f"```\\n{out[:1700]}\\n```")
-
-@bot.command(name="profile")
-async def cmd_profile(ctx, *, raw: str = ""):
-    """
-    Save a profile memory about a person.
-    Usage: !profile @User | text
-           !profile 123456789012345678 | text
-    """
-    if not raw:
-        await ctx.send("Usage: !profile @User | text")
-        return
-
-    if ctx.channel.id not in ALLOWED_CHANNEL_IDS:
-        return
-
-    if "|" not in raw:
-        await ctx.send("Usage: !profile @User | text")
-        return
-
-    left, text = [s.strip() for s in raw.split("|", 1)]
-    if not text:
-        await ctx.send("Usage: !profile @User | text")
-        return
-
-    user_id = None
-    if ctx.message.mentions:
-        user_id = ctx.message.mentions[0].id
-    else:
-        m = re.search(r"\b(\d{8,20})\b", left)
-        if m:
-            user_id = int(m.group(1))
-
-    if not user_id:
-        await ctx.send("Couldn't find a user. Usage: !profile @User | text")
-        return
-
-    tags = [subject_user_tag(user_id), "profile"]
-
-    res = await remember_event(
-        text=text,
-        tags=tags,
-        importance=1,
-        message=ctx.message,
-        topic_hint=None,
-    )
-
-    if not res:
-        await ctx.send("Profile memory not saved (stage may be < M1).")
-        return
-
-    await ctx.send(f"Saved profile memory for <@{user_id}>.")
-
-@bot.command(name="memlast")
-async def cmd_memlast(ctx, n: int = 5):
-    if ctx.channel.id not in ALLOWED_CHANNEL_IDS:
-        return
-    async with db_lock:
-        rows = await asyncio.to_thread(_debug_last_memories_sync, db_conn, int(n))
-    lines = ["Last memories:"] + [f"- #{r['id']} topic={r['topic_id']} tags={r['tags']}\n  {r['text'][:120]}" for r in rows]
-    await ctx.send("\n".join(lines)[:1900])
-
-def _debug_last_memories_sync(conn, n: int):
-    cur = conn.cursor()
-    cur.execute("SELECT id, text, tags_json, topic_id FROM memory_events ORDER BY id DESC LIMIT ?", (int(n),))
-    out=[]
-    for i,t,tags,topic in cur.fetchall():
-        out.append({"id": i, "text": t or "", "tags": __import__("json").loads(tags or "[]"), "topic_id": topic or ""})
-    return out
-
-@bot.command(name="memfind")
-async def cmd_memfind(ctx, *, q: str):
-    if ctx.channel.id not in ALLOWED_CHANNEL_IDS:
-        return
-    events, summaries = await recall_memory(q, scope="auto")
-    txt = format_memory_for_llm(events, summaries, max_chars=1800)
-    await ctx.send(f"Recall results for: {q}\n{txt}"[:1900])
-
-# NEED TO ADD channel_state.last_mined_message_id later to enable "mine from last cursor" funtionality
-# NEED TO ADD profile referencing via ID, currently profiles are referenced by text and sometimes only first names which will get flimsy later
-@bot.command(name="mine")
-async def cmd_mine(ctx, *args):
-    """
-    Mine high-signal memories from the messages table.
-
-    Usage:
-      !mine
-      !mine <channel_id>
-      !mine <#channel>
-      !mine <channel_id> <limit>
-      !mine <#channel> <limit>
-
-    Optional time-based mode: "hot" / "15m" / "2h" (min 5 min, max 4 hours)
-
-    Example:
-      !mine hot
-      !mine 45m
-      !mine <#channel> hot
-      !mine <#channel> 2h
-
-    Notes:
-      - Runs from any channel, but will only mine channels in ALLOWED_CHANNEL_IDS.
-      - Stores mined items as memory_events via remember_event().
-      - Sets origin provenance to the mined channel (source_channel_id/source_channel_name).
-    """
-    if ctx.channel.id not in ALLOWED_CHANNEL_IDS:
-        await ctx.send("This command isn't enabled in this channel.")
-        return
-
-    if not stage_at_least("M1"):
-        await ctx.send("Memory is not enabled (stage < M1).")
-        return
-
-    # Defaults
-    target_channel_id = ctx.channel.id
-    limit = 200  # default mining window size
-
-    # Parse args: first token may be channel; second may be limit
-    if len(args) >= 1:
-        maybe_ch = _parse_channel_id_token(args[0])
-        if maybe_ch:
-            target_channel_id = maybe_ch
-            if len(args) >= 2 and str(args[1]).isdigit():
-                limit = max(50, min(500, int(args[1])))
-        elif str(args[0]).isdigit():
-            # could be a limit
-            limit = max(50, min(500, int(args[0])))
-
-    if target_channel_id not in ALLOWED_CHANNEL_IDS:
-        await ctx.send("That channel is not in Epoxy's allowlist, so I won't mine it.")
-        return
-
-    # Resolve channel name for provenance (best effort)
-    target_channel_name = None
-    ch_obj = bot.get_channel(target_channel_id)
-    if ch_obj is None:
-        try:
-            ch_obj = await bot.fetch_channel(target_channel_id)
-        except Exception:
-            ch_obj = None
-    if ch_obj is not None:
-        target_channel_name = getattr(ch_obj, "name", None) or str(ch_obj)
-
-    # Optional time-based mode: "hot" / "15m" / "2h"
-    hot_minutes = None
-    for a in args:
-        hm = _parse_duration_to_minutes(str(a))
-        if hm is not None:
-            hot_minutes = max(5, min(240, hm))  # clamp 5m..4h
-            break
-
-    if hot_minutes is not None:
-        since_dt = discord.utils.utcnow() - timedelta(minutes=hot_minutes)
-        since_iso = since_dt.isoformat()
-        async with db_lock:
-            rows = await asyncio.to_thread(
-                _fetch_messages_since_sync,
-                db_conn,
-                target_channel_id,
-                since_iso,
-                500,  # cap so hot can't explode
-            )
-        mode_label = f"hot({hot_minutes}m)"
-    else:
-        async with db_lock:
-            rows = await asyncio.to_thread(_fetch_latest_messages_sync, db_conn, target_channel_id, limit)
-        mode_label = f"last({limit})"
-
-    if not rows:
-        await ctx.send("No messages found to mine for that channel.")
-        return
-
-
-    # Convert to chronological text block (oldest -> newest)
-    # Use your existing formatter to keep consistent line shapes.
-    window_text = _format_recent_context(rows, max_chars=12000, max_line_chars=350)
-
-    # Build strict extraction prompt
-    allowlist = TOPIC_ALLOWLIST[:] if TOPIC_ALLOWLIST else []
-    allowlist_str = ", ".join(allowlist) if allowlist else "(none; use null topic_id)"
-
-    extraction_instructions = f"""
-You are Epoxy's memory miner.
-
-You will be given a block of Discord messages from ONE channel.
-Extract durable, high-signal MEMORY EVENTS only. Do NOT extract chatter unless you are extracting an inside joke, social pattern, or another similar abstraction.
-
-Return a JSON ARRAY ONLY (no markdown, no commentary), with 0-12 items.
-Each item must be an object with EXACT keys:
-- "text": string (max 240 chars), the memory content written as a standalone statement
-- "kind": one of ["decision","policy","canon","profile","proposal","insight","task"]
-- "topic_id": either null OR one of this allowlist: [{allowlist_str}]
-- "importance": 0 or 1 (1 only if it will matter weeks later)
-- "confidence": number 0.0-1.0
-
-Rules:
-- Do NOT invent channel names, dates, authors, or message ids. Do NOT include them in "text".
-- If you cannot confidently assign a topic_id from allowlist, use null.
-- Avoid duplicates / near-duplicates.
-- Prefer writing memories in a neutral factual style.
-- Only produce "profile" if the text is a stable trait or preference about an individual AND the individual's name appears in the window text.
-  For profile items, include the person's name inside "text" (e.g., "Sammy prefers ..."). Still no invented IDs.
-""".strip()
-
-    # Call LLM
-    try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": extraction_instructions[:1900]},
-                {"role": "user", "content": f"Channel window:\n{window_text}"[:12000]},
-            ],
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        await ctx.send(f"Mine failed (LLM error): {e}")
-        return
-
-    items = _extract_json_array(raw)
-    if not items:
-        await ctx.send("Mine produced no usable JSON items.")
-        return
-
-    # Validate + insert
-    allowed_kinds = {"decision","policy","canon","profile","proposal","insight","task"}
-    allow_topics = set(TOPIC_ALLOWLIST or [])
-    saved = 0
-    topics_used: dict[str, int] = {}
-
-    for it in items:
-        try:
-            text = (it.get("text") or "").strip()
-            kind = (it.get("kind") or "").strip().lower()
-            topic_id = it.get("topic_id", None)
-            importance = int(it.get("importance", 0))
-            conf = float(it.get("confidence", 0.0))
-        except Exception:
-            continue
-
-        if not text:
-            continue
-        if kind not in allowed_kinds:
-            kind = "insight"
-        importance = 1 if importance == 1 else 0
-
-        # Topic must be allowlisted or null
-        if isinstance(topic_id, str):
-            topic_id = topic_id.strip().lower()
-            if topic_id not in allow_topics:
-                topic_id = None
-        else:
-            topic_id = None
-
-        # Conservative confidence gate (optional)
-        # If you want it stricter, raise this.
-        if conf < 0.55:
-            continue
-
-        # Build tags: keep kinds, optional topic tag
-        tags = [kind]
-        if topic_id:
-            tags = [topic_id] + tags
-
-        res = await remember_event(
-            text=text,
-            tags=tags,
-            importance=importance,
-            message=ctx.message,  # capture location
-            topic_hint=topic_id,  # ensures topic_id wins if set
-        )
-        if not res:
-            continue
-
-        # Set origin provenance to the mined channel (not the command channel)
-        await set_memory_origin(int(res["id"]), target_channel_id, target_channel_name)
-
-        saved += 1
-        if topic_id:
-            topics_used[topic_id] = topics_used.get(topic_id, 0) + 1
-
-    topic_summary = ", ".join(f"{k}×{v}" for k, v in sorted(topics_used.items(), key=lambda x: (-x[1], x[0])))
-    if not topic_summary:
-        topic_summary = "(none)"
-
-    await ctx.send(
-        f"🧴⛏️ Mined {len(rows)} msgs ({mode_label}) from <#{target_channel_id}> → saved {saved} memories. Topics: {topic_summary}"
-    )
-
-@bot.command(name="ctxpeek")
-async def ctxpeek(ctx: commands.Context, n: int = 10):
-    if not _in_allowed_channel(ctx):
-        return
-    n = max(1, min(int(n), 40))
-    # Use a huge "before" so we get latest
-    before = 2**63 - 1
-    async with db_lock:
-        rows = await asyncio.to_thread(_fetch_recent_context_sync, db_conn, ctx.channel.id, before, n)
-    txt = _format_recent_context(rows, 1900, MAX_LINE_CHARS)
-    await ctx.send(f"Recent context ({len(rows)} rows):\n{txt}")
-
-@bot.command(name="topicsuggest")
-async def cmd_topicsuggest(ctx, *args):
-    """
-    Suggest new topic_ids to add to the allowlist based on:
-      - recent channel messages (default), or
-      - existing saved memory events (mem mode)
-
-    Usage:
-      !topicsuggest
-      !topicsuggest hot
-      !topicsuggest 45m
-      !topicsuggest <#channel> hot
-      !topicsuggest <#channel> 200
-
-      !topicsuggest mem
-      !topicsuggest mem hot
-      !topicsuggest mem 2h
-    """
-    if ctx.channel.id not in ALLOWED_CHANNEL_IDS:
-        await ctx.send("This command isn't enabled in this channel.")
-        return
-
-    # Mode: messages (default) vs memories
-    mode = "messages"
-    for a in args:
-        if str(a).strip().lower() in {"mem", "memory", "memories"}:
-            mode = "memories"
-            break
-
-    target_channel_id = ctx.channel.id
-    limit = 250
-
-    # Parse args: channel + (hot duration OR limit)
-    if len(args) >= 1:
-        maybe_ch = _parse_channel_id_token(str(args[0]))
-        if maybe_ch:
-            target_channel_id = maybe_ch
-            if len(args) >= 2 and str(args[1]).isdigit():
-                limit = max(50, min(500, int(args[1])))
-        elif str(args[0]).isdigit():
-            limit = max(50, min(500, int(args[0])))
-
-    if target_channel_id not in ALLOWED_CHANNEL_IDS:
-        await ctx.send("That channel is not in Epoxy's allowlist, so I won't analyze it.")
-        return
-
-    # duration?
-    hot_minutes = None
-    for a in args:
-        hm = _parse_duration_to_minutes(str(a))
-        if hm is not None:
-            hot_minutes = max(5, min(240, hm))
-            break
-
-    # Resolve channel name (best effort)
-    target_channel_name = None
-    ch_obj = bot.get_channel(target_channel_id)
-    if ch_obj is None:
-        try:
-            ch_obj = await bot.fetch_channel(target_channel_id)
-        except Exception:
-            ch_obj = None
-    if ch_obj is not None:
-        target_channel_name = getattr(ch_obj, "name", None) or str(ch_obj)
-
-    # Fetch window (messages vs memories)
-    if mode == "memories":
-        if hot_minutes is not None:
-            since_dt = discord.utils.utcnow() - timedelta(minutes=hot_minutes)
-            since_iso = since_dt.isoformat()
-            async with db_lock:
-                mem_rows = await asyncio.to_thread(_fetch_memory_events_since_sync, db_conn, since_iso, 400)
-            mode_label = f"mem_hot({hot_minutes}m)"
-        else:
-            async with db_lock:
-                mem_rows = await asyncio.to_thread(_fetch_latest_memory_events_sync, db_conn, 300)
-            mode_label = "mem_last(300)"
-
-        if not mem_rows:
-            await ctx.send("No memory events found to analyze.")
-            return
-
-        window_text = _format_memory_events_window(mem_rows, max_chars=12000)
-        source_label = "MEMORY EVENTS (already curated)"
-
-    else:
-        if hot_minutes is not None:
-            since_dt = discord.utils.utcnow() - timedelta(minutes=hot_minutes)
-            since_iso = since_dt.isoformat()
-            async with db_lock:
-                rows = await asyncio.to_thread(_fetch_messages_since_sync, db_conn, target_channel_id, since_iso, 500)
-            mode_label = f"msg_hot({hot_minutes}m)"
-        else:
-            async with db_lock:
-                rows = await asyncio.to_thread(_fetch_latest_messages_sync, db_conn, target_channel_id, limit)
-            mode_label = f"msg_last({limit})"
-
-        if not rows:
-            await ctx.send("No messages found to analyze.")
-            return
-
-        window_text = _format_recent_context(rows, max_chars=12000, max_line_chars=450)
-        source_label = "RAW MESSAGES (chat log)"
-
-    existing = set(TOPIC_ALLOWLIST or [])
-    existing_str = ", ".join(sorted(existing)) if existing else "(none)"
-
-    prompt = f"""
-    You are Epoxy's topic curator.
-
-    Goal: propose NEW topic_ids to add to an allowlist for organizing memories.
-    You will be given either Discord message logs or memory event entries.
-
-    Return a JSON ARRAY ONLY (no markdown, no commentary), with 0-8 items.
-    Each item must have EXACT keys:
-    - "topic_id": snake_case string, 3-24 chars, [a-z0-9_], must NOT already exist
-    - "label": short human label
-    - "why": 1 sentence why this topic is distinct/useful
-    - "examples": array of 2-3 short phrases quoted/paraphrased from the window (no invention)
-    - "confidence": number 0.0-1.0
-
-    HARD RULES:
-    - Do NOT propose any topic_id that is already in: [{existing_str}]
-    - Do NOT invent themes not supported by the window.
-    - Avoid overly broad topics ("general", "random", "chat").
-    - Avoid overly specific topics tied to a single person, single workshop, single document, or single one-off event.
-    - Each proposed topic MUST be supported by at least 3 distinct messages/memories in the window.
-    - Prefer topics that will still be useful 3+ months from now.
-
-    PREFERRED GRANULARITY (examples of the right size):
-    - epoxy_development (build/test/deploy/memory system)
-    - workshops (planning/running workshop ideas/format)
-    - student_challenges (coaching cases / recurring pain points)
-    - coaching_method (methods/models/frameworks)
-    - governance_and_comms (ethics/docs/guidelines/vibe/public copy)
-
-    If a candidate feels like a subtopic of one of the above sizes, propose the broader bucket instead.
-
-    Return JSON only.
-    """.strip()
-
-
-
-    try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": prompt[:1900]},
-                {"role": "user", "content": (
-                    f"Source: {source_label}\n"
-                    f"Channel: {target_channel_name or target_channel_id}\n"
-                    f"Window:\n{window_text}"
-                )[:12000]},
-            ],
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        await ctx.send(f"topicsuggest failed (LLM error): {e}")
-        return
-
-    items = _extract_json_array(raw)
-
-    # Validate / filter
-    out = []
-    for it in items:
-        tid = (it.get("topic_id") or "").strip().lower()
-        if not _is_valid_topic_id(tid):
-            continue
-        if tid in existing:
-            continue
-        conf = float(it.get("confidence", 0.0) or 0.0)
-        if conf < 0.55:
-            continue
-        out.append({
-            "topic_id": tid,
-            "label": (it.get("label") or "").strip()[:60],
-            "why": (it.get("why") or "").strip()[:180],
-            "examples": [str(x).strip()[:80] for x in (it.get("examples") or [])][:3],
-            "confidence": conf,
-        })
-
-    # Deduplicate by topic_id
-    seen = set()
-    final = []
-    for it in out:
-        if it["topic_id"] in seen:
-            continue
-        seen.add(it["topic_id"])
-        final.append(it)
-
-    # Reply
-    if not final:
-        await ctx.send(f"🧴🗂️ Topic suggestions: none (mode={mode_label} in <#{target_channel_id}>)")
-        return
-
-    # Human summary + JSON payload for copy/paste
-    summary_lines = [f"🧴🗂️ Topic suggestions (mode={mode_label} in <#{target_channel_id}>):"]
-    for it in final[:10]:
-        ex = "; ".join(it["examples"][:2])
-        summary_lines.append(f"- `{it['topic_id']}` ({it['confidence']:.2f}): {it['why']}  e.g. {ex}")
-
-    json_blob = json.dumps(final[:10], indent=2)
-
-    msg = "\n".join(summary_lines)
-    await send_chunked(ctx.channel, msg[:1900])
-    await send_chunked(ctx.channel, f"```json\n{json_blob}\n```")
-
-@bot.command(name="lfg")
-@commands.guild_only()
-async def lfg_command(ctx: commands.Context, target: str, *, message: str | None = None):
-    """
-    Usage:
-      !lfg public  [message]  -> ping Driving Ping in #lfg (public)
-      !lfg members [message]  -> ping Driving Ping in #paddock-lounge
-    """
-
-    # 1) Restrict where this command can be used
-    if ctx.channel.id != LFG_SOURCE_CHANNEL_ID:
-        await ctx.reply(
-            "Use this command in the #looking-for-group-pings channel.",
-            mention_author=False,
-        )
-        return
-
-    # 2) Ensure caller is a member (Discovery or Mastery by keyword)
-    if not isinstance(ctx.author, discord.Member) or not user_is_member(ctx.author):
-        await ctx.reply(
-            "Only Lumeris members can start LFG pings.",
-            mention_author=False,
-        )
-        return
-
-    # 3) Normalize and validate target
-    target = target.lower()
-    if target not in ("public", "members"):
-        await ctx.reply(
-            "Usage: `!lfg public <message>` or `!lfg members <message>`",
-            mention_author=False,
-        )
-        return
-
-    # 4) Resolve destination channel
-    dest_channel_id = LFG_PUBLIC_CHANNEL_ID if target == "public" else PADDOCK_LOUNGE_CHANNEL_ID
-    dest_channel = ctx.guild.get_channel(dest_channel_id)
-    if dest_channel is None:
-        await ctx.reply(
-            "I couldn't find the destination channel. Check my channel IDs in the config.",
-            mention_author=False,
-        )
-        return
-
-    # 5) Resolve the opt-in ping role
-    ping_role = discord.utils.get(ctx.guild.roles, name=LFG_ROLE_NAME)
-    if ping_role is None:
-        await ctx.reply(
-            f"I couldn't find a role named `{LFG_ROLE_NAME}`. "
-            "Create it or update my config.",
-            mention_author=False,
-        )
-        return
-
-    # 6) Build and send the ping
-    base = f"{ping_role.mention} — {ctx.author.mention} is looking for a group."
-    if message:
-        base += f" {message}"
-
-    await dest_channel.send(base)
-
-    # 7) Confirm back in the source channel without extra pings
-    await ctx.reply(
-        f"LFG ping sent to {dest_channel.mention}.",
-        mention_author=False,
-    )
-
-
 # Backfill config
-BACKFILL_LIMIT = int(os.getenv("EPOXY_BACKFILL_LIMIT", "2000"))  # per channel, first boot
-BACKFILL_PAUSE_EVERY = 200
-BACKFILL_PAUSE_SECONDS = 0.25
-RECENT_CONTEXT_LIMIT = int(os.getenv("EPOXY_RECENT_CONTEXT_LIMIT", "40"))
-RECENT_CONTEXT_MAX_CHARS = int(os.getenv("EPOXY_RECENT_CONTEXT_CHARS", "6000"))
-MAX_LINE_CHARS = int(os.getenv("EPOXY_RECENT_CONTEXT_LINE_CHARS", "600"))
+BACKFILL_LIMIT = int(os.getenv("EPOXY_BACKFILL_LIMIT", str(DEFAULT_BACKFILL_LIMIT)))  # per channel, first boot
+BACKFILL_PAUSE_EVERY = DEFAULT_BACKFILL_PAUSE_EVERY
+BACKFILL_PAUSE_SECONDS = DEFAULT_BACKFILL_PAUSE_SECONDS
+RECENT_CONTEXT_LIMIT = int(os.getenv("EPOXY_RECENT_CONTEXT_LIMIT", str(DEFAULT_RECENT_CONTEXT_LIMIT)))
+RECENT_CONTEXT_MAX_CHARS = int(os.getenv("EPOXY_RECENT_CONTEXT_CHARS", str(DEFAULT_RECENT_CONTEXT_MAX_CHARS)))
+MAX_LINE_CHARS = int(os.getenv("EPOXY_RECENT_CONTEXT_LINE_CHARS", str(DEFAULT_RECENT_CONTEXT_LINE_CHARS)))
 
-async def backfill_channel(channel: discord.abc.Messageable) -> None:
-    if not hasattr(channel, "id"):
-        return
+def _build_welcome_panel() -> discord.ui.View:
+    return build_welcome_panel(
+        full_access_url=FULL_ACCESS_URL,
+        access_role_keyword=ACCESS_ROLE_KEYWORD,
+        driving_role_keyword=DRIVING_ROLE_KEYWORD,
+    )
 
-    channel_id = channel.id
-    if channel_id not in ALLOWED_CHANNEL_IDS:
-        return
+announcement_service = AnnouncementService(
+    db_lock=db_lock,
+    db_conn=db_conn,
+    client=client,
+    openai_model=OPENAI_MODEL,
+    stage_at_least=stage_at_least,
+    recall_memory_func=recall_memory,
+    format_memory_for_llm=format_memory_for_llm,
+    utc_iso=utc_iso,
+    templates_path=ANNOUNCE_TEMPLATES_PATH,
+    enabled=ANNOUNCE_ENABLED,
+    timezone_name=ANNOUNCE_TIMEZONE,
+    prep_time_local=ANNOUNCE_PREP_TIME_LOCAL,
+    prep_channel_id=ANNOUNCE_PREP_CHANNEL_ID,
+    prep_role_name=ANNOUNCE_PREP_ROLE_NAME,
+    dry_run=ANNOUNCE_DRY_RUN,
+)
 
-    if BOOTSTRAP_CHANNEL_RESET:
-        await reset_backfill_done(channel_id)
+async def announcement_loop() -> None:
+    return await announcement_loop_service(
+        bot=bot,
+        announcement_service=announcement_service,
+        interval_seconds=ANNOUNCE_TICK_SECONDS,
+    )
 
-    if await is_backfill_done(channel_id):
-        return
-
-    print(f"[Backfill] Starting channel {channel_id} ({getattr(channel, 'name', 'unknown')}) "
-          f"limit={BACKFILL_LIMIT} bootstrap_capture={BOOTSTRAP_BACKFILL_CAPTURE}")
-
-    count = 0
-    captured = 0
-    try:
-        async for msg in channel.history(limit=BACKFILL_LIMIT, oldest_first=True):
-            # Skip other bots but keep Epoxy for context coherence
-            if msg.author.bot and bot.user and msg.author.id != bot.user.id:
-                continue
-
-            await log_message(msg)
-
-            if BOOTSTRAP_BACKFILL_CAPTURE and stage_at_least("M1"):
-                try:
-                    # auto-capture only captures decision/policy/canon/#mem patterns by default
-                    await maybe_auto_capture(msg)
-                    # maybe_auto_capture doesn't return a boolean; if you want counts,
-                    # you can add a return value later. For now just track messages processed.
-                    captured += 1
-                except Exception as e:
-                    print(f"[AutoCapture] Error: {e}")
-
-            count += 1
-            if count % BACKFILL_PAUSE_EVERY == 0:
-                await asyncio.sleep(BACKFILL_PAUSE_SECONDS)
-    except Exception as e:
-        print(f"[Backfill] Error in channel {channel_id}: {e}")
-        return
-
-    await mark_backfill_done(channel_id)
-    print(f"[Backfill] Done channel {channel_id}. Logged {count} messages. BootstrapProcessed={captured}")
-
-async def maybe_auto_capture(message: discord.Message) -> None:
-    """Optional heuristics to store high-signal items without manual commands."""
-    if not (AUTO_CAPTURE and stage_at_least("M1")):
-        return
-    content = (message.content or "").strip()
-    if not content:
-        return
-
-    m = re.match(r"^(decision|policy|canon|profile)\s*(\(([^)]+)\))?\s*:\s*(.+)$", content, flags=re.I)
-    if m:
-        kind = m.group(1).lower()
-        topic = (m.group(3) or "").strip()
-        text = (m.group(4) or "").strip()
-        tags = [kind]
-        if topic:
-            tags = [topic] + tags
-        await remember_event(text=text, tags=tags, importance=1, message=message, topic_hint=topic if topic else None)
-        return
-
-    # Lightweight hashtag style: \"#mem topic_id: ...\"
-    m2 = re.match(r"^#mem\s+([a-zA-Z0-9_\\-]{3,})\s*:\s*(.+)$", content)
-    if m2:
-        topic = m2.group(1).strip().lower()
-        text = (m2.group(2) or "").strip()
-        await remember_event(text=text, tags=[topic], importance=1, message=message, topic_hint=topic)
-        return
-
-
-
-@bot.event
-async def on_ready():
-    print(f"Epoxy is online as {bot.user}")
-    if BOOTSTRAP_CHANNEL_RESET_ALL:
-        await reset_all_backfill_done()
-        print ("[Backfill] Reset ALL backfill_done flags (bootstrap)")
-    # One-time backfill for each allowed channel (only if not already done in DB)
-    for channel_id in ALLOWED_CHANNEL_IDS:
-        ch = bot.get_channel(channel_id)
-        if ch is None:
-            # Not cached yet; try fetching
-            try:
-                ch = await bot.fetch_channel(channel_id)
-            except Exception as e:
-                print(f"[Backfill] Could not fetch channel {channel_id}: {e}")
-                continue
-        await backfill_channel(ch)
-
-    # Start background maintenance (cleanup / optional summaries) once per process
-    if stage_at_least("M1") and not getattr(bot, "_maintenance_task", None):
-        bot._maintenance_task = asyncio.create_task(maintenance_loop())
-        print(f"[Memory] maintenance loop started (stage={MEMORY_STAGE})")
-
-@bot.event
-async def on_message(message: discord.Message):
-    # Ignore channels we don’t care about
-    if message.channel.id not in ALLOWED_CHANNEL_IDS:
-        return
-
-    # Log Epoxy’s own bot messages (so recent-context includes her questions/answers)
-    if message.author.bot:
-        if bot.user and message.author.id == bot.user.id:
-            await log_message(message)
-        return
-
-    # Always log human messages in allowed channels
-    await log_message(message)
-
-    # Optional auto-capture of high-signal items into persistent memory
-    await maybe_auto_capture(message)
-
-    # Let command processing happen (so !mine/!topicsuggest etc work even without @mention)
-    if (message.content or "").lstrip().startswith("!"):
-        await bot.process_commands(message)
-        return
-
-    # Only respond if mentioned
-    if bot.user and bot.user in message.mentions:
-        # Strip both <@id> and <@!id>
-        prompt = re.sub(rf"<@!?\s*{bot.user.id}\s*>", "", message.content or "").strip()
-
-        if not prompt:
-            await message.channel.send("Yep? 🧴")
-            await bot.process_commands(message)
-            return
-
-        try:
-            MAX_MSG_CONTENT = 1900
-
-            # --- Recent context ---
-            recent_context, ctx_rows = await get_recent_channel_context(message.channel.id, message.id)
-
-            # Keep the most-recent tail of context if it exceeds budget
-            if len(recent_context) > MAX_MSG_CONTENT:
-                recent_context = recent_context[-MAX_MSG_CONTENT:]
-
-            # --- Reply anchors (interleaving-safe continuity) ---
-            # These let the model bind short replies ("yes", "fun vibe") to the correct last Epoxy question
-            anchor_block = ""
-            async with db_lock:
-                # last Epoxy line before this message
-                bot_rows = await asyncio.to_thread(
-                    _fetch_last_messages_by_author_sync,
-                    db_conn,
-                    message.channel.id,
-                    message.id,
-                    "%Epoxy%",  # adjust if your bot author_name format differs
-                    1,
-                )
-                # last line from same user before this message
-                # Use author_id if you have it; name matching is a best-effort fallback.
-                user_rows = await asyncio.to_thread(
-                    _fetch_last_messages_by_author_sync,
-                    db_conn,
-                    message.channel.id,
-                    message.id,
-                    f"%{message.author.name}%",
-                    1,
-                )
-
-            def _fmt_anchor(rows, label: str) -> str:
-                if not rows:
-                    return ""
-                ts, who, txt = rows[0]
-                clean = " ".join((txt or "").split())
-                if len(clean) > 420:
-                    clean = clean[:419] + "…"
-                return f"{label}: [{ts}] {who}: {clean}"
-
-            parts = []
-            b = _fmt_anchor(bot_rows, "LAST EPOXY MESSAGE")
-            u = _fmt_anchor(user_rows, "LAST MESSAGE FROM THIS USER")
-            if b:
-                parts.append(b)
-            if u:
-                parts.append(u)
-            if parts:
-                anchor_block = (
-                    "Reply anchors (use these to interpret short replies like 'yes', 'fun vibe', 'agree'):\n"
-                    + "\n".join(parts)
-                )
-                if len(anchor_block) > MAX_MSG_CONTENT:
-                    anchor_block = anchor_block[-MAX_MSG_CONTENT:]
-
-            # --- Packs / prompt ---
-            context_pack = build_context_pack()[:MAX_MSG_CONTENT]
-            safe_prompt = prompt[:MAX_MSG_CONTENT]
-
-            memory_pack = ""
-            if stage_at_least("M1"):
-                scope = infer_scope(safe_prompt) if stage_at_least("M2") else "auto"
-                events, summaries = await recall_memory(safe_prompt, scope=scope)
-                memory_pack = format_memory_for_llm(events, summaries, max_chars=MAX_MSG_CONTENT)
-                if len(memory_pack) > MAX_MSG_CONTENT:
-                    memory_pack = memory_pack[:MAX_MSG_CONTENT]  # keep head: most relevant first
-
-            print(
-                f"[CTX] channel={message.channel.id} rows={ctx_rows} before={message.id} "
-                f"ctx_chars={len(recent_context)} pack_chars={len(context_pack)} prompt_chars={len(safe_prompt)} "
-                f"mem_chars={len(memory_pack)} stage={MEMORY_STAGE} limit={RECENT_CONTEXT_LIMIT}"
-            )
-
-            INSTRUCTIONS = (
-                "Use ONLY the context provided in this request: "
-                "(1) Recent channel context, "
-                "(2) Relevant persistent memory (if provided), and "
-                "(3) Topic summaries (if provided). "
-                "Do not rely on general knowledge.\n"
-                "CRITICAL ATTRIBUTION RULE: Do NOT invent metadata (channel name, user, date, message id, source). "
-                "If a detail is not explicitly present, label it as unknown.\n"
-                "CORESPONSE/CONTINUITY RULE: If the user reply is short (<= 6 words), interpret it as an answer to "
-                "Epoxy's most recent direct question/offer in the recent context unless the user clearly starts a new task.\n"
-                "COREFERENCE RULE: If the user uses a pronoun (he/she/they/it/that) and the recent channel context "
-                "clearly names a single likely referent in the last 1–3 turns, assume that referent. "
-                "Ask a clarifying question ONLY if there are 2+ plausible referents in the last 3 turns.\n"
-                "If the provided context is insufficient to answer, say so and ask 1 clarifying question."
-            )[:MAX_MSG_CONTENT]
-
-            chat_messages = [
-                {"role": "system", "content": SYSTEM_PROMPT_BASE[:MAX_MSG_CONTENT]},
-                {"role": "system", "content": context_pack},
-                {"role": "system", "content": INSTRUCTIONS},
-            ]
-
-            # Insert anchors BEFORE the recent context so the model treats them as routing hints
-            if anchor_block:
-                chat_messages.append({"role": "system", "content": anchor_block[:MAX_MSG_CONTENT]})
-
-            chat_messages.append(
-                {"role": "system", "content": f"Recent channel context:\n{recent_context}"[:MAX_MSG_CONTENT]}
-            )
-
-            if stage_at_least("M1") and memory_pack:
-                chat_messages.append(
-                    {"role": "system", "content": f"Relevant persistent memory:\n{memory_pack}"[:MAX_MSG_CONTENT]}
-                )
-
-            chat_messages.append({"role": "user", "content": safe_prompt})
-
-            resp = client.chat.completions.create(model=OPENAI_MODEL, messages=chat_messages)
-            reply = resp.choices[0].message.content or "(no output)"
-            await send_chunked(message.channel, reply)
-
-        except Exception as e:
-            print(f"[OpenAI] Error: {e}")
-            await message.channel.send("Epoxy hiccuped. Check logs 🧴⚙️")
-
-    await bot.process_commands(message)
+wire_bot_runtime(
+    bot,
+    allowed_channel_ids=ALLOWED_CHANNEL_IDS,
+    user_is_owner=user_is_owner,
+    fetch_episode_logs_sync=fetch_episode_logs_sync,
+    update_latest_dm_draft_feedback_sync=update_latest_dm_draft_feedback_sync,
+    update_latest_dm_draft_evaluation_sync=update_latest_dm_draft_evaluation_sync,
+    list_schema_migrations_sync=_list_schema_migrations_sync,
+    stage_at_least=stage_at_least,
+    memory_stage=MEMORY_STAGE,
+    memory_stage_rank=MEMORY_STAGE_RANK,
+    auto_capture=AUTO_CAPTURE,
+    auto_summary=AUTO_SUMMARY,
+    topic_suggest=TOPIC_SUGGEST,
+    topic_min_conf=TOPIC_MIN_CONF,
+    topic_allowlist=TOPIC_ALLOWLIST,
+    db_lock=db_lock,
+    db_conn=db_conn,
+    topic_counts_sync=_topic_counts_sync,
+    list_known_topics_sync=_list_known_topics_sync,
+    get_topic_summary_sync=_get_topic_summary_sync,
+    summarize_topic_func=summarize_topic,
+    send_chunked=send_chunked,
+    normalize_tags=normalize_tags,
+    remember_event_func=remember_event,
+    infer_scope=infer_scope,
+    recall_memory_func=recall_memory,
+    format_memory_for_llm=format_memory_for_llm,
+    subject_user_tag=subject_user_tag,
+    parse_channel_id_token=_parse_channel_id_token,
+    parse_duration_to_minutes=_parse_duration_to_minutes,
+    fetch_messages_since_sync=_fetch_messages_since_sync,
+    fetch_latest_messages_sync=_fetch_latest_messages_sync,
+    fetch_memory_events_since_sync=_fetch_memory_events_since_sync,
+    fetch_latest_memory_events_sync=_fetch_latest_memory_events_sync,
+    fetch_recent_context_sync=_fetch_recent_context_sync,
+    format_recent_context=_format_recent_context,
+    format_memory_events_window=_format_memory_events_window,
+    extract_json_array=_extract_json_array,
+    is_valid_topic_id=_is_valid_topic_id,
+    set_memory_origin_func=set_memory_origin,
+    client=client,
+    openai_model=OPENAI_MODEL,
+    max_line_chars=MAX_LINE_CHARS,
+    welcome_channel_id=WELCOME_CHANNEL_ID,
+    welcome_panel_factory=_build_welcome_panel,
+    lfg_source_channel_id=LFG_SOURCE_CHANNEL_ID,
+    lfg_public_channel_id=LFG_PUBLIC_CHANNEL_ID,
+    paddock_lounge_channel_id=PADDOCK_LOUNGE_CHANNEL_ID,
+    lfg_role_name=LFG_ROLE_NAME,
+    user_is_member=user_is_member,
+    bootstrap_channel_reset_all=BOOTSTRAP_CHANNEL_RESET_ALL,
+    bootstrap_channel_reset=BOOTSTRAP_CHANNEL_RESET,
+    bootstrap_backfill_capture=BOOTSTRAP_BACKFILL_CAPTURE,
+    reset_all_backfill_done_func=reset_all_backfill_done,
+    reset_backfill_done_func=reset_backfill_done,
+    is_backfill_done_func=is_backfill_done,
+    mark_backfill_done_func=mark_backfill_done,
+    backfill_limit=BACKFILL_LIMIT,
+    backfill_pause_every=BACKFILL_PAUSE_EVERY,
+    backfill_pause_seconds=BACKFILL_PAUSE_SECONDS,
+    log_message_func=log_message,
+    maintenance_loop_func=maintenance_loop,
+    get_recent_channel_context_func=get_recent_channel_context,
+    fetch_last_messages_by_author_sync=_fetch_last_messages_by_author_sync,
+    build_context_pack=build_context_pack,
+    classify_context=classify_context,
+    founder_user_ids=FOUNDER_USER_IDS,
+    channel_policy_groups=CHANNEL_POLICY_GROUPS,
+    recall_profile_for_user_func=recall_profile_for_user,
+    format_profile_for_llm=format_profile_for_llm,
+    dm_guidelines=DM_GUIDELINES,
+    dm_guidelines_source=DM_GUIDELINES_SOURCE,
+    get_or_create_context_profile_sync=get_or_create_context_profile_sync,
+    upsert_user_profile_last_seen_sync=upsert_user_profile_last_seen_sync,
+    select_active_controller_config_sync=select_active_controller_config_sync,
+    utc_iso=utc_iso,
+    system_prompt_base=SYSTEM_PROMPT_BASE,
+    enable_episode_logging=ENABLE_EPISODE_LOGGING,
+    episode_log_filters=EPISODE_LOG_FILTERS,
+    insert_episode_log_sync=insert_episode_log_sync,
+    recent_context_limit=RECENT_CONTEXT_LIMIT,
+    announcement_enabled=ANNOUNCE_ENABLED,
+    announcement_service=announcement_service,
+    announcement_loop_func=announcement_loop,
+)
 
 
 
 bot.run(DISCORD_TOKEN)
+
+
+
+
+

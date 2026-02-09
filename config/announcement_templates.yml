@@ -1,0 +1,141 @@
+# Production starter template for announcement automation (v1.1).
+# Fill channel IDs and enable the days you want.
+# Times are interpreted in `timezone` unless overridden by env.
+timezone: UTC
+prep_time_local: "09:00"
+prep_channel_id: 0 # replace with prep channel id (thread host)
+prep_role_name: "" # optional role name to mention on prep ping
+days:
+  monday:
+    enabled: false # set true when configured
+    target_channel_id: 0 # replace with announcement destination channel id
+    publish_time_local: "16:00"
+    tone: "Clear, concise, and operational."
+    structure:
+      - "Headline"
+      - "Key Updates"
+      - "Actions / Next Steps"
+    questions:
+      - id: "headline"
+        prompt: "What is the one-line headline for tomorrow?"
+        required: true
+      - id: "updates"
+        prompt: "What are the key updates to include?"
+        required: true
+      - id: "actions"
+        prompt: "What actions or asks should members take?"
+        required: false
+  tuesday:
+    enabled: false
+    target_channel_id: 0
+    publish_time_local: "16:00"
+    tone: "Supportive and specific."
+    structure:
+      - "Opening"
+      - "Progress"
+      - "What We Need"
+    questions:
+      - id: "opening"
+        prompt: "What is the opening context for tomorrow?"
+        required: true
+      - id: "progress"
+        prompt: "What progress should be highlighted?"
+        required: true
+      - id: "asks"
+        prompt: "What support or responses do we need?"
+        required: false
+  wednesday:
+    enabled: false
+    target_channel_id: 0
+    publish_time_local: "16:00"
+    tone: "Calm, grounded, and practical."
+    structure:
+      - "Context"
+      - "Main Points"
+      - "Timing / Logistics"
+    questions:
+      - id: "context"
+        prompt: "What context is essential for tomorrow?"
+        required: true
+      - id: "main_points"
+        prompt: "What main points must be covered?"
+        required: true
+      - id: "logistics"
+        prompt: "What timing or logistics should be included?"
+        required: false
+  thursday:
+    enabled: false
+    target_channel_id: 0
+    publish_time_local: "16:00"
+    tone: "Direct and motivating."
+    structure:
+      - "Topline"
+      - "Details"
+      - "CTA"
+    questions:
+      - id: "topline"
+        prompt: "What is the topline message?"
+        required: true
+      - id: "details"
+        prompt: "What details need to be stated clearly?"
+        required: true
+      - id: "cta"
+        prompt: "What call-to-action should we include?"
+        required: false
+  friday:
+    enabled: false
+    target_channel_id: 0
+    publish_time_local: "16:00"
+    tone: "Warm and celebratory, with clear next actions."
+    structure:
+      - "Win / Highlight"
+      - "Summary"
+      - "Next"
+    questions:
+      - id: "win"
+        prompt: "What win or highlight should we call out?"
+        required: true
+      - id: "summary"
+        prompt: "What summary points should be included?"
+        required: true
+      - id: "next"
+        prompt: "What are the next actions?"
+        required: false
+  saturday:
+    enabled: false
+    target_channel_id: 0
+    publish_time_local: "12:00"
+    tone: "Light but still clear."
+    structure:
+      - "Update"
+      - "Schedule"
+      - "Optional Engagement"
+    questions:
+      - id: "update"
+        prompt: "What update should we share?"
+        required: true
+      - id: "schedule"
+        prompt: "What schedule details matter?"
+        required: false
+      - id: "engagement"
+        prompt: "Any optional engagement prompt?"
+        required: false
+  sunday:
+    enabled: false
+    target_channel_id: 0
+    publish_time_local: "12:00"
+    tone: "Reflective and orienting."
+    structure:
+      - "Reflection"
+      - "Plan Ahead"
+      - "Reminders"
+    questions:
+      - id: "reflection"
+        prompt: "What reflection or context is useful?"
+        required: true
+      - id: "plan_ahead"
+        prompt: "What should people plan for next?"
+        required: true
+      - id: "reminders"
+        prompt: "Any reminders to include?"
+        required: false
