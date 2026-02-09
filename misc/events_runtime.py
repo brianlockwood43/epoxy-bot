@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
+import traceback
 
 import discord
 from controller.dm_episode_artifact import build_dm_episode_artifact
@@ -818,6 +819,7 @@ def register_runtime_events(
 
             except Exception as e:
                 print(f"[OpenAI] Error: {e}")
+                traceback.print_exc()
                 await message.channel.send("Epoxy hiccuped. Check logs.")
 
         await bot.process_commands(message)

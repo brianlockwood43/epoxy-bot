@@ -88,6 +88,7 @@ from misc.adhoc_modules.announcements_service import AnnouncementService
 from misc.adhoc_modules.announcements_service import default_templates_path as announcement_templates_path_default
 from misc.adhoc_modules.welcome_panel import build_welcome_panel
 from retrieval.service import budget_and_diversify_events as retrieval_budget_and_diversify_events
+from retrieval.fts_query import build_fts_query
 from retrieval.service import format_memory_events_window as format_memory_events_window_service
 from retrieval.service import format_memory_for_llm as format_memory_for_llm_service
 from retrieval.service import format_profile_for_llm as format_profile_for_llm_service
@@ -555,19 +556,6 @@ def infer_tier(created_ts: int) -> int:
     if age < 90 * 86400:
         return 2
     return 3
-
-def build_fts_query(q: str) -> str:
-    """Very small, safe-ish FTS5 query builder."""
-    q = (q or "").strip()
-    if not q:
-        return ""
-    # Take words; avoid FTS syntax injection
-    words = re.findall(r"[A-Za-z0-9_\\-]{3,}", q.lower())
-    words = words[:10]
-    if not words:
-        return ""
-    # OR makes recall more forgiving
-    return " OR ".join(words)
 
 def infer_scope(prompt: str) -> str:
     p = (prompt or "").lower()
