@@ -95,12 +95,18 @@
 - Expected subtle behavior changes:
   - controller config selection can prefer person-scoped config over legacy user-scoped config when both exist.
   - profile recall can return de-duplicated results across dual tags instead of duplicate entries.
+### Identity invariants:
+- (`platform`, `external_id`) resolves to exactly one active `person_id` (revocations excluded).
+- `person_id` is the only canonical join key; `user_id` is compatibility-only and must not become authoritative in new readers.
+- New profile memories must include `subject:person:<id>`; `subject:user:<discord_id>` is optional compatibility.
 
 ## Risks and sharp edges
 - Corrupt historical data (e.g., duplicate active identifiers) can trigger warnings and require cleanup.
 - Tag bridge migration depends on parseable `tags_json`; malformed rows are skipped with logging.
 - Merge-chain cycles are guarded and deterministic, but a cycle warning indicates data hygiene issues to fix.
 - Temporary side-by-side complexity remains until full legacy dependency removal.
+- Rollback posture:
+  - Legacy `user_id` fields remain written for compatibility, but rollback safety depends on whether any new readers now assume `person_id` presence. If person resolution is disabled, ensure DM/mention flows degrade gracefully rather than hard-failing.
 
 ## How to test (smoke + edge cases)
 - [x] 3-5 copy/paste test prompts or commands.
@@ -117,6 +123,9 @@
 - Setup notes:
   - no special env required for migration unit tests; tests use SQLite in-memory connections.
   - some runtime-target tests skip when `discord.py` is not installed.
+- Edge-case scenarios:
+  - Create duplicate active (`platform`, `external_id`) identifiers → expect deterministic canonical resolution + warning, no new person creation.
+  - Insert malformed `tags_json` on a legacy memory row → migration skips with logging; runtime recall still returns correct results via remaining valid tags.
 
 ## Evaluation hooks
 - [x] Feedback commands / rating mapping.
