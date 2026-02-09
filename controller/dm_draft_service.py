@@ -106,7 +106,8 @@ def select_mode(*, mode_requested: str | None, prompt_text: str) -> tuple[str, s
     requested = (mode_requested or "").strip().lower().replace("-", "_")
     if requested in {"collab", "best_effort"}:
         return (requested, mode_inferred)
-    return (mode_inferred, mode_inferred)
+    # Trial policy: auto/default is collaboration-first.
+    return ("collab", mode_inferred)
 
 
 def build_collab_questions(missing_fields: list[str]) -> list[str]:
@@ -350,20 +351,96 @@ def compute_recall_coverage(
 def _safe_extract_json_obj(text: str) -> dict | None:
     if not text:
         return None
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
-    match = re.search(r"\{.*\}", text, flags=re.S)
-    if not match:
-        return None
-    try:
-        parsed = json.loads(match.group(0))
-    except Exception:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+
+    def _escape_newlines_in_json_strings(raw: str) -> str:
+        out: list[str] = []
+        in_string = False
+        escaped = False
+        for ch in raw:
+            if in_string:
+                if escaped:
+                    out.append(ch)
+                    escaped = False
+                    continue
+                if ch == "\\":
+                    out.append(ch)
+                    escaped = True
+                    continue
+                if ch == '"':
+                    out.append(ch)
+                    in_string = False
+                    continue
+                if ch in {"\n", "\r"}:
+                    out.append("\\n")
+                    continue
+                out.append(ch)
+                continue
+
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+        return "".join(out)
+
+    def _iter_json_candidates(raw: str) -> list[str]:
+        candidates: list[str] = []
+        stripped = raw.strip()
+        if stripped:
+            candidates.append(stripped)
+
+        fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw, flags=re.I)
+        if fence:
+            fenced = (fence.group(1) or "").strip()
+            if fenced:
+                candidates.append(fenced)
+
+        starts = [idx for idx, ch in enumerate(raw) if ch == "{"]
+        for start in starts[:12]:
+            depth = 0
+            in_string = False
+            escaped = False
+            for i in range(start, len(raw)):
+                ch = raw[i]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                        continue
+                    if ch == "\\":
+                        escaped = True
+                        continue
+                    if ch == '"':
+                        in_string = False
+                    continue
+
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = raw[start : i + 1].strip()
+                        if candidate:
+                            candidates.append(candidate)
+                        break
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            out.append(item)
+        return out
+
+    for candidate in _iter_json_candidates(text):
+        for probe in (candidate, _escape_newlines_in_json_strings(candidate)):
+            try:
+                parsed = json.loads(probe)
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return None
 
 
 def _coerce_variants(payload: dict) -> list[DmDraftVariant]:
@@ -397,8 +474,6 @@ def parse_dm_result_from_model(
     obj = _safe_extract_json_obj(raw_text)
     if obj is None:
         fallback_notes = [str(recall_coverage.get("note") or "Recall coverage unavailable.")]
-        if assumptions_used:
-            fallback_notes.append(f"Assumptions Used: {', '.join(assumptions_used)}")
         return DmDraftResult(
             drafts=[DmDraftVariant(id="primary", label="Primary Draft", text=(raw_text or "").strip() or "(empty draft)")],
             risk_notes=fallback_notes,
@@ -424,8 +499,6 @@ def parse_dm_result_from_model(
     recall_note = str(recall_coverage.get("note") or "")
     if recall_note:
         risk_notes.append(recall_note)
-    if assumptions_used:
-        risk_notes.append(f"Assumptions Used: {', '.join(assumptions_used)}")
 
     optional_tighten = obj.get("optional_tighten")
     if optional_tighten is not None:
@@ -508,6 +581,11 @@ def format_dm_result_for_discord(run: DmDraftRun) -> str:
         lines.append("Risk Notes:")
         for note in run.result.risk_notes:
             lines.append(f"- {note}")
+    if run.assumptions_used:
+        lines.append("")
+        lines.append("Assumptions Used:")
+        for assumption in run.assumptions_used:
+            lines.append(f"- {assumption}")
     if run.result.optional_tighten:
         lines.append("")
         lines.append(f"Optional Tighten: {run.result.optional_tighten}")

@@ -5,7 +5,9 @@ import unittest
 from controller.dm_draft_service import DmDraftVariant
 from controller.dm_draft_service import compute_recall_coverage
 from controller.dm_draft_service import compute_recall_provenance_counts
+from controller.dm_draft_service import DmDraftRun
 from controller.dm_draft_service import evaluate_collab_blocking
+from controller.dm_draft_service import format_dm_result_for_discord
 from controller.dm_draft_service import infer_completion_mode
 from controller.dm_draft_service import parse_dm_result_from_model
 from controller.dm_draft_service import select_mode
@@ -82,6 +84,14 @@ class DmDraftServiceTests(unittest.TestCase):
             prompt_text="Help me think this through.",
         )
         self.assertEqual(mode_inferred, "collab")
+        self.assertEqual(mode_used, "collab")
+
+    def test_select_mode_auto_urgency_still_uses_collab(self):
+        mode_used, mode_inferred = select_mode(
+            mode_requested=None,
+            prompt_text="No time, just draft this ASAP!!! I'm cooked.",
+        )
+        self.assertEqual(mode_inferred, "best_effort")
         self.assertEqual(mode_used, "collab")
 
     def test_collab_blocks_when_target_missing(self):
@@ -188,6 +198,38 @@ class DmDraftServiceTests(unittest.TestCase):
             assumptions_used=[],
         )
         self.assertGreaterEqual(len(result.drafts), 1)
+
+    def test_parse_result_salvages_unescaped_newlines_in_json(self):
+        raw = (
+            '{"drafts":[{"id":"primary","label":"Primary","text":"line one\nline two","rationale":null}],'
+            '"risk_notes":["keep steady"],"optional_tighten":null}'
+        )
+        result = parse_dm_result_from_model(
+            raw,
+            recall_coverage=compute_recall_coverage(1),
+            assumptions_used=["tone=steady"],
+        )
+        self.assertEqual(len(result.drafts), 1)
+        self.assertIn("line one", result.drafts[0].text)
+
+    def test_format_includes_assumptions_used_section(self):
+        result = parse_dm_result_from_model(
+            '{"drafts":[{"id":"primary","label":"Primary","text":"hello","rationale":null}]}',
+            recall_coverage=compute_recall_coverage(1),
+            assumptions_used=["tone=steady", "objective=de-escalate + align next step"],
+        )
+        run = DmDraftRun(
+            result=result,
+            mode="collab",
+            parse_quality="partial",
+            missing_fields=["objective", "tone"],
+            assumptions_used=["tone=steady", "objective=de-escalate + align next step"],
+            clarifying_questions=[],
+            recall_count=1,
+        )
+        formatted = format_dm_result_for_discord(run)
+        self.assertIn("Assumptions Used:", formatted)
+        self.assertIn("tone=steady", formatted)
 
 
 if __name__ == "__main__":

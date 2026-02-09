@@ -432,6 +432,19 @@ def register_runtime_events(
                     clarifying_questions = build_collab_questions(
                         critical_missing_fields if blocking_collab else parsed.missing_fields
                     ) if mode == "collab" else []
+                    should_offer_best_effort_confirm = (
+                        mode == "collab"
+                        and not blocking_collab
+                        and (mode_requested is None or str(mode_requested).strip().lower() == "auto")
+                        and mode_inferred == "best_effort"
+                        and parsed.parse_quality in {"partial", "insufficient"}
+                    )
+                    if should_offer_best_effort_confirm:
+                        confirm_line = (
+                            "If speed matters more than precision, reply `mode=best_effort` and "
+                            "I'll draft immediately with explicit assumptions."
+                        )
+                        clarifying_questions = [confirm_line] + clarifying_questions[:2]
 
                     if blocking_collab:
                         lines = [
