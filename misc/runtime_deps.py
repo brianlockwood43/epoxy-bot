@@ -29,6 +29,9 @@ class RuntimeDeps:
     get_recent_channel_context_func: Callable
     fetch_last_messages_by_author_sync: Callable
     get_or_create_context_profile_sync: Callable
+    get_or_create_person_sync: Callable
+    resolve_person_id_sync: Callable
+    canonical_person_id_sync: Callable
     upsert_user_profile_last_seen_sync: Callable
     select_active_controller_config_sync: Callable
 
@@ -36,7 +39,7 @@ class RuntimeDeps:
     infer_scope: Callable[[str], str]
     recall_memory_func: Callable
     format_memory_for_llm: Callable
-    recall_profile_for_user_func: Callable
+    recall_profile_for_identity_func: Callable
     format_profile_for_llm: Callable
     dm_guidelines: Any
     dm_guidelines_source: str

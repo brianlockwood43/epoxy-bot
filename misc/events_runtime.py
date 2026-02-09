@@ -312,6 +312,20 @@ def register_runtime_events(
                 )
 
                 async with deps.db_lock:
+                    person_origin = f"discord:{int(message.guild.id)}" if message.guild else "discord:dm"
+                    actor_person_id = await asyncio.to_thread(
+                        deps.get_or_create_person_sync,
+                        deps.db_conn,
+                        platform="discord",
+                        external_id=str(int(message.author.id)),
+                        origin=person_origin,
+                        label="discord_user_id",
+                    )
+                    actor_person_id = await asyncio.to_thread(
+                        deps.canonical_person_id_sync,
+                        deps.db_conn,
+                        int(actor_person_id),
+                    )
                     context_profile_id = await asyncio.to_thread(
                         deps.get_or_create_context_profile_sync,
                         deps.db_conn,
@@ -327,7 +341,7 @@ def register_runtime_events(
                     await asyncio.to_thread(
                         deps.upsert_user_profile_last_seen_sync,
                         deps.db_conn,
-                        int(message.author.id),
+                        int(actor_person_id),
                         deps.utc_iso(),
                     )
                     controller_cfg = await asyncio.to_thread(
@@ -336,6 +350,7 @@ def register_runtime_events(
                         caller_type=runtime_ctx["caller_type"],
                         context_profile_id=int(context_profile_id),
                         user_id=int(message.author.id),
+                        person_id=int(actor_person_id),
                     )
 
                 route = classify_mention_route(safe_prompt)
@@ -350,6 +365,24 @@ def register_runtime_events(
                     req = parsed.request
                     target_fields = _resolve_dm_target_fields(req=req, message=message, deps=deps)
                     req.target_user_id = int(target_fields["target_user_id"]) if target_fields["target_user_id"] is not None else None
+                    target_person_id: int | None = None
+                    if req.target_user_id is not None:
+                        target_origin = f"discord:{int(message.guild.id)}" if message.guild else "discord:dm"
+                        async with deps.db_lock:
+                            target_person_id = await asyncio.to_thread(
+                                deps.get_or_create_person_sync,
+                                deps.db_conn,
+                                platform="discord",
+                                external_id=str(int(req.target_user_id)),
+                                origin=target_origin,
+                                label="discord_user_id",
+                            )
+                            target_person_id = await asyncio.to_thread(
+                                deps.canonical_person_id_sync,
+                                deps.db_conn,
+                                int(target_person_id),
+                            )
+                    target_fields["target_person_id"] = int(target_person_id) if target_person_id is not None else None
 
                     mode_requested = req.mode
                     mode, mode_inferred = select_mode(mode_requested=mode_requested, prompt_text=dm_payload)
@@ -367,6 +400,7 @@ def register_runtime_events(
                     dm_parse_payload = {
                         "target": req.target,
                         "target_user_id": target_fields["target_user_id"],
+                        "target_person_id": target_fields["target_person_id"],
                         "target_display_name": target_fields["target_display_name"],
                         "target_type": target_fields["target_type"],
                         "target_confidence": target_fields["target_confidence"],
@@ -434,6 +468,7 @@ def register_runtime_events(
                                 "timestamp_utc": deps.utc_iso(),
                                 "context_profile_id": int(context_profile_id),
                                 "user_id": int(message.author.id),
+                                "person_id": int(actor_person_id),
                                 "controller_config_id": int(controller_cfg.get("id")) if controller_cfg.get("id") is not None else None,
                                 "input_excerpt": safe_prompt[:500],
                                 "assistant_output_excerpt": reply[:800],
@@ -444,7 +479,9 @@ def register_runtime_events(
                                     f"surface:{runtime_ctx['surface']}",
                                     f"caller:{runtime_ctx['caller_type']}",
                                     f"group:{runtime_ctx['channel_policy_group']}",
+                                    f"actor_person:{int(actor_person_id)}",
                                     f"target_user:{target_fields['target_user_id'] if target_fields['target_user_id'] is not None else 'none'}",
+                                    f"target_person:{target_fields['target_person_id'] if target_fields['target_person_id'] is not None else 'none'}",
                                     f"target_type:{target_fields['target_type']}",
                                     f"target_entity:{target_fields['target_entity_key']}",
                                     f"guideline_pack:{deps.dm_guidelines.version}",
@@ -466,6 +503,7 @@ def register_runtime_events(
                                     "draft_variant_id": None,
                                     "prompt_fingerprint": prompt_fingerprint,
                                     "target_user_id": target_fields["target_user_id"],
+                                    "target_person_id": target_fields["target_person_id"],
                                     "target_display_name": target_fields["target_display_name"],
                                     "target_type": target_fields["target_type"],
                                     "target_confidence": target_fields["target_confidence"],
@@ -473,6 +511,7 @@ def register_runtime_events(
                                     **dm_artifact,
                                 },
                                 "target_user_id": target_fields["target_user_id"],
+                                "target_person_id": target_fields["target_person_id"],
                                 "target_display_name": target_fields["target_display_name"],
                                 "target_type": target_fields["target_type"],
                                 "target_confidence": target_fields["target_confidence"],
@@ -521,11 +560,22 @@ def register_runtime_events(
 
                     profile_events: list[dict] = []
                     profile_pack = ""
-                    if req.target_user_id is not None:
-                        profile_events = await deps.recall_profile_for_user_func(int(req.target_user_id), 6)
-                        display_name = req.target or str(req.target_user_id)
+                    if req.target_user_id is not None or target_fields["target_person_id"] is not None:
+                        profile_events = await deps.recall_profile_for_identity_func(
+                            int(target_fields["target_person_id"]) if target_fields["target_person_id"] is not None else None,
+                            int(req.target_user_id) if req.target_user_id is not None else None,
+                            6,
+                        )
+                        profile_block_id = int(target_fields["target_person_id"] or req.target_user_id or 0)
+                        display_name = req.target or str(req.target_user_id or target_fields["target_person_id"])
                         profile_pack = deps.format_profile_for_llm(
-                            [(int(req.target_user_id), display_name, profile_events)],
+                            [
+                                (
+                                    profile_block_id,
+                                    display_name,
+                                    profile_events,
+                                )
+                            ],
                             max_chars=900,
                         )[:max_msg_content]
 
@@ -610,6 +660,7 @@ def register_runtime_events(
                             "timestamp_utc": deps.utc_iso(),
                             "context_profile_id": int(context_profile_id),
                             "user_id": int(message.author.id),
+                            "person_id": int(actor_person_id),
                             "controller_config_id": int(controller_cfg.get("id")) if controller_cfg.get("id") is not None else None,
                             "input_excerpt": safe_prompt[:500],
                             "assistant_output_excerpt": reply[:800],
@@ -619,7 +670,9 @@ def register_runtime_events(
                                 f"surface:{runtime_ctx['surface']}",
                                 f"caller:{runtime_ctx['caller_type']}",
                                 f"group:{runtime_ctx['channel_policy_group']}",
+                                f"actor_person:{int(actor_person_id)}",
                                 f"target_user:{target_fields['target_user_id'] if target_fields['target_user_id'] is not None else 'none'}",
+                                f"target_person:{target_fields['target_person_id'] if target_fields['target_person_id'] is not None else 'none'}",
                                 f"target_type:{target_fields['target_type']}",
                                 f"target_entity:{target_fields['target_entity_key']}",
                                 f"guideline_pack:{deps.dm_guidelines.version}",
@@ -644,6 +697,7 @@ def register_runtime_events(
                                 "recall_coverage_count": int(recall_count),
                                 "recall_provenance_counts": dict(recall_provenance_counts),
                                 "target_user_id": target_fields["target_user_id"],
+                                "target_person_id": target_fields["target_person_id"],
                                 "target_display_name": target_fields["target_display_name"],
                                 "target_type": target_fields["target_type"],
                                 "target_confidence": target_fields["target_confidence"],
@@ -651,6 +705,7 @@ def register_runtime_events(
                                 **dm_artifact,
                             },
                             "target_user_id": target_fields["target_user_id"],
+                            "target_person_id": target_fields["target_person_id"],
                             "target_display_name": target_fields["target_display_name"],
                             "target_type": target_fields["target_type"],
                             "target_confidence": target_fields["target_confidence"],
@@ -740,6 +795,7 @@ def register_runtime_events(
                         "timestamp_utc": deps.utc_iso(),
                         "context_profile_id": int(context_profile_id),
                         "user_id": int(message.author.id),
+                        "person_id": int(actor_person_id),
                         "controller_config_id": int(controller_cfg.get("id")) if controller_cfg.get("id") is not None else None,
                         "input_excerpt": safe_prompt[:500],
                         "assistant_output_excerpt": reply[:800],
@@ -748,6 +804,7 @@ def register_runtime_events(
                             f"surface:{runtime_ctx['surface']}",
                             f"caller:{runtime_ctx['caller_type']}",
                             f"group:{runtime_ctx['channel_policy_group']}",
+                            f"actor_person:{int(actor_person_id)}",
                         ],
                         "implicit_signals": {"ctx_rows": int(ctx_rows), "memory_hits": len(retrieved_memory_ids)},
                         "guild_id": int(message.guild.id) if message.guild else None,

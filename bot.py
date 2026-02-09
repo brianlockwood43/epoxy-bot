@@ -30,6 +30,10 @@ from config.defaults import RESERVED_KIND_TAGS
 from config.defaults import STAGE_RANK
 from config.defaults import WELCOME_CHANNEL_ID
 from controller.dm_guidelines import load_dm_guidelines
+from controller.identity_store import canonical_person_id_sync
+from controller.identity_store import dedupe_memory_events_by_id
+from controller.identity_store import get_or_create_person_sync
+from controller.identity_store import resolve_person_id_sync
 from controller.context import (
     classify_context,
     parse_id_set,
@@ -406,7 +410,7 @@ def init_db(db_path: str) -> sqlite3.Connection:
         required_messages = ["message_id", "channel_id", "author_id", "created_at_utc", "content"]
         required_controller = [
             ("context_profiles", ["caller_type", "surface", "allowed_capabilities_json"]),
-            ("user_profiles", ["layer_estimate", "risk_flags_json", "last_seen_at_utc"]),
+            ("user_profiles", ["person_id", "layer_estimate", "risk_flags_json", "last_seen_at_utc"]),
             ("controller_configs", ["scope", "persona", "depth", "strictness", "intervention_level"]),
             (
                 "episode_logs",
@@ -414,8 +418,10 @@ def init_db(db_path: str) -> sqlite3.Connection:
                     "timestamp_utc",
                     "context_profile_id",
                     "user_id",
+                    "person_id",
                     "controller_config_id",
                     "target_user_id",
+                    "target_person_id",
                     "target_display_name",
                     "target_type",
                     "target_confidence",
@@ -535,6 +541,10 @@ def normalize_tags(tags: list[str]) -> list[str]:
 def subject_user_tag(user_id: int) -> str:
     return f"subject:user:{int(user_id)}"
 
+
+def subject_person_tag(person_id: int) -> str:
+    return f"subject:person:{int(person_id)}"
+
 def infer_tier(created_ts: int) -> int:
     """0=hot (0-24h), 1=warm (1-14d), 2=cold (14-90d), 3=archive (>90d)"""
     age = max(0, int(time.time()) - int(created_ts or 0))
@@ -648,12 +658,56 @@ def _insert_memory_event_sync(conn: sqlite3.Connection, payload: dict) -> int:
 def _mark_events_summarized_sync(conn: sqlite3.Connection, event_ids: list[int]) -> None:
     mark_events_summarized_store(conn, event_ids)
 
-async def recall_profile_for_user(user_id: int, limit: int = 6) -> list[dict]:
+async def recall_profile_for_identity(
+    person_id: int | None,
+    user_id: int | None,
+    limit: int = 6,
+) -> list[dict]:
     if not stage_at_least("M1"):
         return []
-    tag = subject_user_tag(user_id)
+    lim = max(1, int(limit))
+    search_lim = max(lim * 2, lim)
+
     async with db_lock:
-        return await asyncio.to_thread(_search_memory_events_by_tag_sync, db_conn, tag, "profile", limit)
+        canonical_person_id: int | None = int(person_id) if person_id is not None else None
+        if canonical_person_id is not None:
+            canonical_person_id = await asyncio.to_thread(canonical_person_id_sync, db_conn, int(canonical_person_id))
+
+        if canonical_person_id is None and user_id is not None:
+            canonical_person_id = await asyncio.to_thread(
+                resolve_person_id_sync,
+                db_conn,
+                "discord",
+                str(int(user_id)),
+            )
+
+        merged: list[dict] = []
+        if canonical_person_id is not None:
+            merged.extend(
+                await asyncio.to_thread(
+                    _search_memory_events_by_tag_sync,
+                    db_conn,
+                    subject_person_tag(int(canonical_person_id)),
+                    "profile",
+                    search_lim,
+                )
+            )
+        if user_id is not None:
+            merged.extend(
+                await asyncio.to_thread(
+                    _search_memory_events_by_tag_sync,
+                    db_conn,
+                    subject_user_tag(int(user_id)),
+                    "profile",
+                    search_lim,
+                )
+            )
+
+        return dedupe_memory_events_by_id(merged, limit=lim)
+
+
+async def recall_profile_for_user(user_id: int, limit: int = 6) -> list[dict]:
+    return await recall_profile_for_identity(None, int(user_id), limit=limit)
 
 def _search_memory_events_by_tag_sync(conn, subject_tag: str, kind_tag: str, limit: int) -> list[dict]:
     return search_memory_events_by_tag_store(
@@ -1061,6 +1115,8 @@ wire_bot_runtime(
     recall_memory_func=recall_memory,
     format_memory_for_llm=format_memory_for_llm,
     subject_user_tag=subject_user_tag,
+    subject_person_tag=subject_person_tag,
+    get_or_create_person_sync=get_or_create_person_sync,
     parse_channel_id_token=_parse_channel_id_token,
     parse_duration_to_minutes=_parse_duration_to_minutes,
     fetch_messages_since_sync=_fetch_messages_since_sync,
@@ -1101,11 +1157,13 @@ wire_bot_runtime(
     classify_context=classify_context,
     founder_user_ids=FOUNDER_USER_IDS,
     channel_policy_groups=CHANNEL_POLICY_GROUPS,
-    recall_profile_for_user_func=recall_profile_for_user,
+    recall_profile_for_identity_func=recall_profile_for_identity,
     format_profile_for_llm=format_profile_for_llm,
     dm_guidelines=DM_GUIDELINES,
     dm_guidelines_source=DM_GUIDELINES_SOURCE,
     get_or_create_context_profile_sync=get_or_create_context_profile_sync,
+    resolve_person_id_sync=resolve_person_id_sync,
+    canonical_person_id_sync=canonical_person_id_sync,
     upsert_user_profile_last_seen_sync=upsert_user_profile_last_seen_sync,
     select_active_controller_config_sync=select_active_controller_config_sync,
     utc_iso=utc_iso,

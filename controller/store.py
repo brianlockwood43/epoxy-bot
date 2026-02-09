@@ -5,6 +5,8 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
+from controller.identity_store import get_or_create_person_sync
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -48,12 +50,40 @@ def ensure_controller_schema(conn: sqlite3.Connection) -> None:
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS user_profiles (
-            id INTEGER PRIMARY KEY,
+            person_id INTEGER PRIMARY KEY,
             layer_estimate TEXT DEFAULT 'unknown',
             risk_flags_json TEXT DEFAULT '[]',
             preferred_tone TEXT,
             dev_arc_meta_ids_json TEXT DEFAULT '[]',
             last_seen_at_utc TEXT
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS people (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT,
+            origin TEXT,
+            status TEXT DEFAULT 'active',
+            merged_into_person_id INTEGER
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS person_identifiers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id INTEGER NOT NULL,
+            platform TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            label TEXT,
+            strength TEXT DEFAULT 'primary',
+            created_at TEXT,
+            last_seen_at TEXT,
+            revoked_at TEXT
         )
         """
     )
@@ -84,6 +114,7 @@ def ensure_controller_schema(conn: sqlite3.Connection) -> None:
             timestamp_utc TEXT NOT NULL,
             context_profile_id INTEGER,
             user_id INTEGER,
+            person_id INTEGER,
             controller_config_id INTEGER,
             input_excerpt TEXT,
             assistant_output_excerpt TEXT,
@@ -93,6 +124,7 @@ def ensure_controller_schema(conn: sqlite3.Connection) -> None:
             implicit_signals_json TEXT DEFAULT '{}',
             human_notes TEXT,
             target_user_id INTEGER,
+            target_person_id INTEGER,
             target_display_name TEXT,
             target_type TEXT,
             target_confidence REAL,
@@ -122,10 +154,12 @@ def ensure_controller_schema(conn: sqlite3.Connection) -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_controller_configs_lifecycle ON controller_configs(lifecycle)")
     for stmt in (
         "ALTER TABLE episode_logs ADD COLUMN target_user_id INTEGER",
+        "ALTER TABLE episode_logs ADD COLUMN target_person_id INTEGER",
         "ALTER TABLE episode_logs ADD COLUMN target_display_name TEXT",
         "ALTER TABLE episode_logs ADD COLUMN target_type TEXT",
         "ALTER TABLE episode_logs ADD COLUMN target_confidence REAL",
         "ALTER TABLE episode_logs ADD COLUMN target_entity_key TEXT",
+        "ALTER TABLE episode_logs ADD COLUMN person_id INTEGER",
         "ALTER TABLE episode_logs ADD COLUMN mode_requested TEXT",
         "ALTER TABLE episode_logs ADD COLUMN mode_inferred TEXT",
         "ALTER TABLE episode_logs ADD COLUMN mode_used TEXT",
@@ -144,14 +178,30 @@ def ensure_controller_schema(conn: sqlite3.Connection) -> None:
             pass
     cur.execute("CREATE INDEX IF NOT EXISTS idx_episode_logs_timestamp ON episode_logs(timestamp_utc)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_episode_logs_user_id ON episode_logs(user_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_episode_logs_person_id ON episode_logs(person_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_episode_logs_context ON episode_logs(context_profile_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_episode_logs_target_user_id ON episode_logs(target_user_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_episode_logs_target_person_id ON episode_logs(target_person_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_episode_logs_target_entity_key ON episode_logs(target_entity_key)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_episode_logs_mode_used ON episode_logs(mode_used)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_episode_logs_dm_guidelines_version ON episode_logs(dm_guidelines_version)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_episode_logs_blocking_collab ON episode_logs(blocking_collab)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_episode_logs_draft_variant_id ON episode_logs(draft_variant_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_episode_logs_prompt_fingerprint ON episode_logs(prompt_fingerprint)")
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_person_identifiers_platform_external_active
+        ON person_identifiers(platform, external_id)
+        WHERE revoked_at IS NULL
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_person_identifiers_person_platform_active
+        ON person_identifiers(person_id, platform, revoked_at)
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_person_identifiers_person_id ON person_identifiers(person_id)")
 
     conn.commit()
 
@@ -298,19 +348,37 @@ def get_or_create_context_profile_sync(conn: sqlite3.Connection, payload: dict[s
     return int(cur.lastrowid)
 
 
-def upsert_user_profile_last_seen_sync(conn: sqlite3.Connection, user_id: int, last_seen_at_utc: str | None = None) -> None:
+def upsert_user_profile_last_seen_sync(conn: sqlite3.Connection, person_id: int, last_seen_at_utc: str | None = None) -> None:
     cur = conn.cursor()
     ts = last_seen_at_utc or _utc_now_iso()
     cur.execute(
         """
-        INSERT INTO user_profiles (id, last_seen_at_utc)
+        INSERT INTO user_profiles (person_id, last_seen_at_utc)
         VALUES (?, ?)
-        ON CONFLICT(id) DO UPDATE SET
+        ON CONFLICT(person_id) DO UPDATE SET
             last_seen_at_utc = excluded.last_seen_at_utc
         """,
-        (int(user_id), ts),
+        (int(person_id), ts),
     )
     conn.commit()
+
+
+def upsert_user_profile_last_seen_by_user_id_sync(
+    conn: sqlite3.Connection,
+    user_id: int,
+    last_seen_at_utc: str | None = None,
+    *,
+    origin: str = "discord:legacy",
+) -> int:
+    person_id = get_or_create_person_sync(
+        conn,
+        platform="discord",
+        external_id=str(int(user_id)),
+        origin=origin,
+        label="discord_user_id",
+    )
+    upsert_user_profile_last_seen_sync(conn, int(person_id), last_seen_at_utc=last_seen_at_utc)
+    return int(person_id)
 
 
 def select_active_controller_config_sync(
@@ -319,14 +387,20 @@ def select_active_controller_config_sync(
     caller_type: str,
     context_profile_id: int,
     user_id: int,
+    person_id: int | None = None,
 ) -> dict[str, Any]:
     cur = conn.cursor()
-    scope_priority = [
-        f"user_id:{int(user_id)}",
-        f"context_profile_id:{int(context_profile_id)}",
-        f"caller_type:{caller_type}",
-        "global",
-    ]
+    scope_priority: list[str] = []
+    if person_id is not None:
+        scope_priority.append(f"person_id:{int(person_id)}")
+    scope_priority.extend(
+        [
+            f"user_id:{int(user_id)}",
+            f"context_profile_id:{int(context_profile_id)}",
+            f"caller_type:{caller_type}",
+            "global",
+        ]
+    )
 
     for scope in scope_priority:
         cur.execute(
@@ -370,22 +444,23 @@ def insert_episode_log_sync(conn: sqlite3.Connection, payload: dict[str, Any]) -
     cur.execute(
         """
         INSERT INTO episode_logs (
-            timestamp_utc, context_profile_id, user_id, controller_config_id,
+            timestamp_utc, context_profile_id, user_id, person_id, controller_config_id,
             input_excerpt, assistant_output_excerpt,
             retrieved_memory_ids_json, tags_json,
             explicit_rating, implicit_signals_json, human_notes,
-            target_user_id, target_display_name, target_type, target_confidence, target_entity_key,
+            target_user_id, target_person_id, target_display_name, target_type, target_confidence, target_entity_key,
             mode_requested, mode_inferred, mode_used,
             dm_guidelines_version, dm_guidelines_source,
             blocking_collab, critical_missing_fields_json, blocking_reason,
             draft_version, draft_variant_id, prompt_fingerprint,
             guild_id, channel_id, message_id, created_at_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload.get("timestamp_utc") or now,
             payload.get("context_profile_id"),
             payload.get("user_id"),
+            payload.get("person_id"),
             payload.get("controller_config_id"),
             payload.get("input_excerpt"),
             payload.get("assistant_output_excerpt"),
@@ -395,6 +470,7 @@ def insert_episode_log_sync(conn: sqlite3.Connection, payload: dict[str, Any]) -
             _dumps(payload.get("implicit_signals", {}), "{}"),
             payload.get("human_notes"),
             payload.get("target_user_id"),
+            payload.get("target_person_id"),
             payload.get("target_display_name"),
             payload.get("target_type"),
             payload.get("target_confidence"),
@@ -425,9 +501,9 @@ def fetch_episode_logs_sync(conn: sqlite3.Connection, limit: int = 20) -> list[d
     cur.execute(
         """
         SELECT
-            el.id, el.timestamp_utc, el.user_id, el.input_excerpt, el.assistant_output_excerpt,
+            el.id, el.timestamp_utc, el.user_id, el.person_id, el.input_excerpt, el.assistant_output_excerpt,
             el.retrieved_memory_ids_json, el.tags_json, el.explicit_rating,
-            el.target_user_id, el.target_display_name, el.target_type, el.target_confidence, el.target_entity_key,
+            el.target_user_id, el.target_person_id, el.target_display_name, el.target_type, el.target_confidence, el.target_entity_key,
             el.mode_requested, el.mode_inferred, el.mode_used,
             el.dm_guidelines_version, el.dm_guidelines_source,
             el.blocking_collab, el.critical_missing_fields_json, el.blocking_reason,
@@ -451,36 +527,38 @@ def fetch_episode_logs_sync(conn: sqlite3.Connection, limit: int = 20) -> list[d
                 "id": int(row[0]),
                 "timestamp_utc": row[1],
                 "user_id": row[2],
-                "input_excerpt": row[3] or "",
-                "assistant_output_excerpt": row[4] or "",
-                "retrieved_memory_ids": _loads(row[5], []),
-                "tags": _loads(row[6], []),
-                "explicit_rating": row[7],
-                "target_user_id": row[8],
-                "target_display_name": row[9],
-                "target_type": row[10] or "unknown",
-                "target_confidence": row[11],
-                "target_entity_key": row[12],
-                "mode_requested": row[13],
-                "mode_inferred": row[14],
-                "mode_used": row[15],
-                "dm_guidelines_version": row[16],
-                "dm_guidelines_source": row[17],
-                "blocking_collab": bool(int(row[18] or 0)),
-                "critical_missing_fields": _loads(row[19], []),
-                "blocking_reason": row[20],
-                "draft_version": row[21],
-                "draft_variant_id": row[22],
-                "prompt_fingerprint": row[23],
-                "guild_id": row[24],
-                "channel_id": row[25],
-                "message_id": row[26],
-                "caller_type": row[27] or "unknown",
-                "surface": row[28] or "unknown",
-                "sensitivity_policy_id": row[29] or "policy:default",
-                "controller_config_id": row[30],
-                "controller_scope": row[31] or "unknown",
-                "controller_persona": row[32] or "guide",
+                "person_id": row[3],
+                "input_excerpt": row[4] or "",
+                "assistant_output_excerpt": row[5] or "",
+                "retrieved_memory_ids": _loads(row[6], []),
+                "tags": _loads(row[7], []),
+                "explicit_rating": row[8],
+                "target_user_id": row[9],
+                "target_person_id": row[10],
+                "target_display_name": row[11],
+                "target_type": row[12] or "unknown",
+                "target_confidence": row[13],
+                "target_entity_key": row[14],
+                "mode_requested": row[15],
+                "mode_inferred": row[16],
+                "mode_used": row[17],
+                "dm_guidelines_version": row[18],
+                "dm_guidelines_source": row[19],
+                "blocking_collab": bool(int(row[20] or 0)),
+                "critical_missing_fields": _loads(row[21], []),
+                "blocking_reason": row[22],
+                "draft_version": row[23],
+                "draft_variant_id": row[24],
+                "prompt_fingerprint": row[25],
+                "guild_id": row[26],
+                "channel_id": row[27],
+                "message_id": row[28],
+                "caller_type": row[29] or "unknown",
+                "surface": row[30] or "unknown",
+                "sensitivity_policy_id": row[31] or "policy:default",
+                "controller_config_id": row[32],
+                "controller_scope": row[33] or "unknown",
+                "controller_persona": row[34] or "guide",
             }
         )
     return out

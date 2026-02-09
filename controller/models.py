@@ -16,7 +16,7 @@ class ContextProfile:
 
 @dataclass(slots=True)
 class UserProfile:
-    id: int
+    person_id: int
     layer_estimate: str = "unknown"
     risk_flags: list[str] = field(default_factory=list)
     preferred_tone: str | None = None
@@ -45,6 +45,7 @@ class EpisodeLog:
     timestamp_utc: str
     context_profile_id: int
     user_id: int
+    person_id: int | None
     controller_config_id: int
     input_excerpt: str
     assistant_output_excerpt: str
@@ -54,6 +55,7 @@ class EpisodeLog:
     implicit_signals: dict = field(default_factory=dict)
     human_notes: str | None = None
     target_user_id: int | None = None
+    target_person_id: int | None = None
     target_display_name: str | None = None
     target_type: str = "unknown"
     target_confidence: float | None = None

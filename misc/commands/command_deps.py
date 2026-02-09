@@ -45,6 +45,8 @@ class CommandDeps:
     recall_memory_func: Callable | None = None
     format_memory_for_llm: Callable | None = None
     subject_user_tag: Callable[[int], str] | None = None
+    subject_person_tag: Callable[[int], str] | None = None
+    get_or_create_person_sync: Callable | None = None
     parse_channel_id_token: Callable | None = None
     parse_duration_to_minutes: Callable | None = None
     fetch_messages_since_sync: Callable | None = None

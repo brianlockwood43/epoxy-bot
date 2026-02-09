@@ -187,7 +187,17 @@ def register(
             await ctx.send("Couldn't find a user. Usage: !profile @User | text")
             return
 
-        tags = [deps.subject_user_tag(user_id), "profile"]
+        person_origin = f"discord:{int(ctx.guild.id)}" if getattr(ctx, "guild", None) is not None else "discord:dm"
+        async with deps.db_lock:
+            person_id = await asyncio.to_thread(
+                deps.get_or_create_person_sync,
+                deps.db_conn,
+                platform="discord",
+                external_id=str(int(user_id)),
+                origin=person_origin,
+                label="discord_user_id",
+            )
+        tags = [deps.subject_person_tag(int(person_id)), deps.subject_user_tag(user_id), "profile"]
         res = await deps.remember_event_func(
             text=text,
             tags=tags,
