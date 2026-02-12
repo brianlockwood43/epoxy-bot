@@ -252,3 +252,22 @@ def register(
             actor_user_id=int(ctx.author.id),
         )
         await ctx.send(msg if ok else f"Error: {msg}")
+
+    @bot.command(name="announce.prep_tomorrow_now")
+    async def announce_prep_tomorrow_now(ctx: commands.Context):
+        if not in_allowed_channel_or_thread(ctx):
+            return
+        if not require_owner(ctx):
+            await ctx.send("This command is owner-only.")
+            return
+        target_date = await deps.announcement_service.resolve_target_date(
+            date_token=None,
+            default_mode="tomorrow",
+            channel_id=int(getattr(ctx.channel, "id", 0) or 0),
+        )
+        ok, msg = await deps.announcement_service.prep_now(
+            bot=bot,
+            target_date_local=target_date,
+            actor_user_id=int(ctx.author.id),
+        )
+        await ctx.send(msg if ok else f"Error: {msg}")

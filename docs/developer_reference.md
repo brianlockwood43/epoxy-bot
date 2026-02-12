@@ -173,6 +173,10 @@ Use this with:
 - Access: owner-only, allowed channels or allowed-channel threads
 - Purpose: force immediate post path for approved cycle
 
+12. `!announce.prep_tomorrow_now`
+- Access: owner-only, allowed channels or allowed-channel threads
+- Purpose: force-send tomorrow prep prompt/thread immediately (no posting)
+
 ---
 
 ## Environment Variables

@@ -58,6 +58,8 @@ class AnnouncementTemplateDay:
     tone: str
     structure: list[str]
     questions: list[dict[str, Any]]
+    style_notes: str
+    style_examples: list[dict[str, str]]
 
 
 class AnnouncementService:
@@ -159,6 +161,20 @@ class AnnouncementService:
                     }
                 )
 
+            style_raw = d.get("style_guidance") if isinstance(d.get("style_guidance"), dict) else {}
+            style_notes = str(style_raw.get("notes") or "").strip()
+            style_examples_raw = style_raw.get("examples") if isinstance(style_raw.get("examples"), list) else []
+            normalized_style_examples: list[dict[str, str]] = []
+            for idx, ex in enumerate(style_examples_raw):
+                if not isinstance(ex, dict):
+                    continue
+                text = str(ex.get("text") or "").strip()
+                if not text:
+                    continue
+                ex_id = str(ex.get("id") or f"example_{idx + 1}").strip()
+                summary = str(ex.get("summary") or "").strip()
+                normalized_style_examples.append({"id": ex_id, "summary": summary, "text": text})
+
             publish_local = str(d.get("publish_time_local") or "16:00").strip()
             try:
                 self._parse_hhmm(publish_local)
@@ -172,6 +188,12 @@ class AnnouncementService:
                 "tone": str(d.get("tone") or "").strip(),
                 "structure": [str(x).strip() for x in (d.get("structure") or []) if str(x).strip()],
                 "questions": normalized_questions,
+                "style_guidance": {
+                    "notes": style_notes,
+                    "examples": normalized_style_examples,
+                }
+                if style_notes or normalized_style_examples
+                else None,
             }
 
         merged = {
@@ -234,6 +256,18 @@ class AnnouncementService:
         d = days.get(day_key) if isinstance(days, dict) else None
         if not isinstance(d, dict):
             return None
+        style_raw = d.get("style_guidance") if isinstance(d.get("style_guidance"), dict) else {}
+        style_examples_raw = style_raw.get("examples") if isinstance(style_raw.get("examples"), list) else []
+        style_examples: list[dict[str, str]] = []
+        for idx, ex in enumerate(style_examples_raw):
+            if not isinstance(ex, dict):
+                continue
+            text = str(ex.get("text") or "").strip()
+            if not text:
+                continue
+            ex_id = str(ex.get("id") or f"example_{idx + 1}").strip()
+            summary = str(ex.get("summary") or "").strip()
+            style_examples.append({"id": ex_id, "summary": summary, "text": text})
         return AnnouncementTemplateDay(
             weekday_key=day_key,
             enabled=bool(d.get("enabled", False)),
@@ -242,6 +276,8 @@ class AnnouncementService:
             tone=str(d.get("tone") or ""),
             structure=list(d.get("structure") or []),
             questions=list(d.get("questions") or []),
+            style_notes=str(style_raw.get("notes") or "").strip(),
+            style_examples=style_examples,
         )
 
     def _publish_at_utc(self, *, target_date_local: str, publish_time_local: str) -> str:
@@ -426,6 +462,27 @@ class AnnouncementService:
                 lines.append(f"- TODO({qid})")
         return "\n".join(lines).strip()
 
+    def _style_prompt_block(self, day: AnnouncementTemplateDay) -> str:
+        notes = (day.style_notes or "").strip()
+        examples = list(day.style_examples or [])[:2]
+        if not notes and not examples:
+            return ""
+        lines: list[str] = []
+        if notes:
+            lines.append(f"Style notes: {notes}")
+        if examples:
+            lines.append("Style reference examples (for style inspiration only):")
+            for idx, ex in enumerate(examples, start=1):
+                ex_id = str(ex.get("id") or f"example_{idx}").strip()
+                summary = str(ex.get("summary") or "").strip()
+                text = str(ex.get("text") or "").strip()
+                if summary:
+                    lines.append(f"- Example {idx} ({ex_id}) summary: {summary}")
+                else:
+                    lines.append(f"- Example {idx} ({ex_id})")
+                lines.append(f"  text: {text}")
+        return "\n".join(lines).strip()
+
     @staticmethod
     def _enforce_todo_markers(text: str, missing_required: list[str]) -> str:
         out = (text or "").strip()
@@ -468,8 +525,11 @@ class AnnouncementService:
             "Generate a concise, publish-ready Discord announcement.\n"
             "Follow tone and structure exactly. Use provided answers and memory context if present.\n"
             "Do not invent concrete claims not supported by inputs.\n"
+            "If style guidance references are provided, use them only to infer voice and structure; do not copy wording.\n"
             "If required inputs are missing, keep TODO(question_id) markers in the draft."
         )
+        style_block = self._style_prompt_block(day)
+        style_section = f"Style guidance:\n{style_block}\n\n" if style_block else ""
         user_prompt = (
             f"Target date: {target_date_local}\n"
             f"Weekday: {day.weekday_key}\n"
@@ -477,6 +537,7 @@ class AnnouncementService:
             f"Structure sections: {', '.join(day.structure) if day.structure else '(no explicit sections)'}\n\n"
             f"Q&A inputs:\n{qa_block}\n\n"
             f"Relevant memory context:\n{memory_pack or '(none)'}\n\n"
+            f"{style_section}"
             "Return only the announcement body."
         )
 
@@ -795,6 +856,55 @@ class AnnouncementService:
             except Exception:
                 pass
 
+    async def _trigger_prep_ping(
+        self,
+        *,
+        bot,
+        cycle: dict[str, Any],
+        day: AnnouncementTemplateDay,
+        actor_type: str,
+        actor_user_id: int | None,
+    ) -> tuple[bool, str]:
+        try:
+            prep_message_id, prep_thread_id = await self._send_prep_prompt(bot, cycle, day)
+            async with self.db_lock:
+                _ = await asyncio.to_thread(
+                    set_prep_refs_sync,
+                    self.db_conn,
+                    cycle_id=int(cycle["id"]),
+                    prep_channel_id=int(self._effective_prep_channel_id()),
+                    prep_message_id=prep_message_id,
+                    prep_thread_id=prep_thread_id,
+                )
+                await asyncio.to_thread(
+                    insert_audit_log_sync,
+                    self.db_conn,
+                    cycle_id=int(cycle["id"]),
+                    action="prep_pinged",
+                    actor_type=actor_type,
+                    actor_user_id=actor_user_id,
+                    payload={"prep_message_id": prep_message_id, "prep_thread_id": prep_thread_id},
+                )
+            return (True, "Prep prompt sent.")
+        except Exception as e:
+            async with self.db_lock:
+                _ = await asyncio.to_thread(
+                    update_cycle_fields_sync,
+                    self.db_conn,
+                    int(cycle["id"]),
+                    {"last_error": str(e)[:300]},
+                )
+                await asyncio.to_thread(
+                    insert_audit_log_sync,
+                    self.db_conn,
+                    cycle_id=int(cycle["id"]),
+                    action="prep_ping_failed",
+                    actor_type=actor_type,
+                    actor_user_id=actor_user_id,
+                    payload={"error": str(e)[:200]},
+                )
+            return (False, f"Prep ping failed: {str(e)[:160]}")
+
     async def _publish_cycle(self, bot, cycle: dict[str, Any], *, actor_type: str, actor_user_id: int | None) -> tuple[bool, str]:
         if str(cycle.get("status")) != "approved":
             return (False, f"Cycle status is {cycle.get('status')}; not publishable.")
@@ -848,6 +958,29 @@ class AnnouncementService:
             return (False, f"Cycle is terminal ({cycle.get('status')}); cannot post.")
         return await self._publish_cycle(bot, cycle, actor_type="user", actor_user_id=int(actor_user_id))
 
+    async def prep_now(self, *, bot, target_date_local: str, actor_user_id: int) -> tuple[bool, str]:
+        cycle = await self.ensure_cycle_for_date(target_date_local)
+        if not cycle:
+            return (False, f"No enabled announcement day config for {target_date_local}.")
+        status = str(cycle.get("status") or "")
+        if status in ANNOUNCEMENT_TERMINAL_STATES:
+            return (False, f"Cycle is terminal ({status}); prep ping blocked.")
+        if status != "planned":
+            return (False, f"Cycle is {status}; prep ping is only available from planned state.")
+        day = self._day_template(target_date_local)
+        if not day:
+            return (False, "No day template found.")
+        ok, msg = await self._trigger_prep_ping(
+            bot=bot,
+            cycle=cycle,
+            day=day,
+            actor_type="user",
+            actor_user_id=int(actor_user_id),
+        )
+        if not ok:
+            return (False, msg)
+        return (True, f"Prep prompt sent for {target_date_local}.")
+
     async def _mark_missed(self, *, bot, cycle: dict[str, Any], reason: str) -> None:
         async with self.db_lock:
             _ = await asyncio.to_thread(mark_missed_sync, self.db_conn, cycle_id=int(cycle["id"]), reason=reason)
@@ -876,43 +1009,13 @@ class AnnouncementService:
         if prep_due and tomorrow_cycle and str(tomorrow_cycle.get("status")) == "planned":
             day = self._day_template(tomorrow_local)
             if day:
-                try:
-                    prep_message_id, prep_thread_id = await self._send_prep_prompt(bot, tomorrow_cycle, day)
-                    async with self.db_lock:
-                        _ = await asyncio.to_thread(
-                            set_prep_refs_sync,
-                            self.db_conn,
-                            cycle_id=int(tomorrow_cycle["id"]),
-                            prep_channel_id=int(self._effective_prep_channel_id()),
-                            prep_message_id=prep_message_id,
-                            prep_thread_id=prep_thread_id,
-                        )
-                        await asyncio.to_thread(
-                            insert_audit_log_sync,
-                            self.db_conn,
-                            cycle_id=int(tomorrow_cycle["id"]),
-                            action="prep_pinged",
-                            actor_type="system",
-                            actor_user_id=None,
-                            payload={"prep_message_id": prep_message_id, "prep_thread_id": prep_thread_id},
-                        )
-                except Exception as e:
-                    async with self.db_lock:
-                        _ = await asyncio.to_thread(
-                            update_cycle_fields_sync,
-                            self.db_conn,
-                            int(tomorrow_cycle["id"]),
-                            {"last_error": str(e)[:300]},
-                        )
-                        await asyncio.to_thread(
-                            insert_audit_log_sync,
-                            self.db_conn,
-                            cycle_id=int(tomorrow_cycle["id"]),
-                            action="prep_ping_failed",
-                            actor_type="system",
-                            actor_user_id=None,
-                            payload={"error": str(e)[:200]},
-                        )
+                await self._trigger_prep_ping(
+                    bot=bot,
+                    cycle=tomorrow_cycle,
+                    day=day,
+                    actor_type="system",
+                    actor_user_id=None,
+                )
 
         today_cycle = await self.ensure_cycle_for_date(today_local)
         if not today_cycle:
@@ -950,5 +1053,6 @@ class AnnouncementService:
 
 
 def default_templates_path() -> str:
-    here = Path(__file__).resolve().parents[1]
+    # This resolves to repo-root/config when running from source checkout.
+    here = Path(__file__).resolve().parents[2]
     return os.path.join(here, "config", "announcement_templates.yml")

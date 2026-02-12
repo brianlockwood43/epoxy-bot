@@ -14,20 +14,24 @@ import yaml
 from db.migrate import apply_sqlite_migrations
 from misc.adhoc_modules.announcements_service import AnnouncementService
 from misc.adhoc_modules.announcements_service import WEEKDAY_KEYS
+from misc.adhoc_modules.announcements_service import default_templates_path
 from misc.adhoc_modules.announcements_store import fetch_answers_sync
 
 
 class _DummyCompletions:
     def __init__(self, text: str):
         self._text = text
+        self.last_create_kwargs: dict | None = None
 
     def create(self, *args, **kwargs):
+        self.last_create_kwargs = {"args": args, "kwargs": kwargs}
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=self._text))])
 
 
 class _DummyClient:
     def __init__(self, text: str = "Draft body"):
-        self.chat = SimpleNamespace(completions=_DummyCompletions(text))
+        self.completions = _DummyCompletions(text)
+        self.chat = SimpleNamespace(completions=self.completions)
 
 
 class _FakeBot:
@@ -134,6 +138,11 @@ class AnnouncementMigrationTests(unittest.TestCase):
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='announcement_cycles'")
         self.assertIsNotNone(cur.fetchone())
 
+    def test_default_templates_path_points_to_repo_config(self):
+        expected = str((_repo_root() / "config" / "announcement_templates.yml").resolve())
+        actual = str(Path(default_templates_path()).resolve())
+        self.assertEqual(actual, expected)
+
 
 class AnnouncementServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -182,6 +191,22 @@ class AnnouncementServiceTests(unittest.IsolatedAsyncioTestCase):
         await svc.run_tick(self.bot)
         await svc.run_tick(self.bot)
         self.assertEqual(len(self.prep_channel.sent), 1)
+
+    async def test_manual_prep_now_triggers_tomorrow_prep_once(self):
+        svc = self._service(
+            enabled_days={_tomorrow_key(): {"enabled": True, "target_channel_id": 200, "publish_time_local": "23:59"}}
+        )
+        target_date = await svc.resolve_target_date(date_token=None, default_mode="tomorrow", channel_id=None)
+        ok, msg = await svc.prep_now(bot=self.bot, target_date_local=target_date, actor_user_id=1)
+        self.assertTrue(ok, msg)
+        self.assertIn("Prep prompt sent", msg)
+        self.assertEqual(len(self.prep_channel.sent), 1)
+        cycle = await svc.fetch_cycle_by_date(target_date)
+        self.assertEqual(cycle["status"], "prep_pinged")
+
+        ok, msg = await svc.prep_now(bot=self.bot, target_date_local=target_date, actor_user_id=1)
+        self.assertFalse(ok)
+        self.assertIn("only available from planned state", msg)
 
     async def test_answer_upsert(self):
         svc = self._service(
@@ -236,6 +261,73 @@ class AnnouncementServiceTests(unittest.IsolatedAsyncioTestCase):
         ok, _, draft = await svc.generate_draft(target_date_local=target_date, actor_user_id=1)
         self.assertTrue(ok)
         self.assertIn("TODO(details)", draft or "")
+
+    async def test_generate_includes_style_guidance_in_prompt_when_present(self):
+        svc = self._service(
+            client_text="Generated draft.",
+            enabled_days={
+                _tomorrow_key(): {
+                    "enabled": True,
+                    "target_channel_id": 200,
+                    "publish_time_local": "23:59",
+                    "style_guidance": {
+                        "notes": "Prioritize concise operational updates and clear asks.",
+                        "examples": [
+                            {
+                                "id": "ops_ref_1",
+                                "summary": "brief operational brief",
+                                "text": "Team, here is today's concise operations update with owners and timing.",
+                            },
+                            {
+                                "id": "ops_ref_2",
+                                "summary": "clear CTA close",
+                                "text": "If you can support, react with a check mark and post your ETA in thread.",
+                            },
+                            {
+                                "id": "ops_ref_3",
+                                "summary": "should be omitted by cap",
+                                "text": "This third example should not appear in the model prompt.",
+                            },
+                        ],
+                    },
+                }
+            },
+        )
+        target_date = await svc.resolve_target_date(date_token=None, default_mode="tomorrow", channel_id=None)
+        ok, _, _ = await svc.generate_draft(target_date_local=target_date, actor_user_id=1)
+        self.assertTrue(ok)
+
+        create_kwargs = svc.client.completions.last_create_kwargs
+        self.assertIsNotNone(create_kwargs)
+        messages = create_kwargs["kwargs"]["messages"]
+        sys_prompt = str(messages[0]["content"])
+        user_prompt = str(messages[1]["content"])
+        self.assertIn("use them only to infer voice and structure; do not copy wording", sys_prompt)
+        self.assertIn("Style notes: Prioritize concise operational updates and clear asks.", user_prompt)
+        self.assertIn("Team, here is today's concise operations update with owners and timing.", user_prompt)
+        self.assertIn("If you can support, react with a check mark and post your ETA in thread.", user_prompt)
+        self.assertNotIn("This third example should not appear in the model prompt.", user_prompt)
+
+    async def test_generate_omits_style_guidance_when_not_configured(self):
+        svc = self._service(
+            client_text="Generated draft.",
+            enabled_days={
+                _tomorrow_key(): {
+                    "enabled": True,
+                    "target_channel_id": 200,
+                    "publish_time_local": "23:59",
+                }
+            },
+        )
+        target_date = await svc.resolve_target_date(date_token=None, default_mode="tomorrow", channel_id=None)
+        ok, _, _ = await svc.generate_draft(target_date_local=target_date, actor_user_id=1)
+        self.assertTrue(ok)
+
+        create_kwargs = svc.client.completions.last_create_kwargs
+        self.assertIsNotNone(create_kwargs)
+        messages = create_kwargs["kwargs"]["messages"]
+        user_prompt = str(messages[1]["content"])
+        self.assertNotIn("Style guidance:", user_prompt)
 
     async def test_approval_gate_enforced(self):
         svc = self._service(
@@ -362,12 +454,20 @@ class AnnouncementCommandAuthTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        for name in ("announce.approve", "announce.done", "announce.undo_done", "announce.post_now"):
+        for name in (
+            "announce.approve",
+            "announce.done",
+            "announce.undo_done",
+            "announce.post_now",
+            "announce.prep_tomorrow_now",
+        ):
             cmd = bot.get_command(name)
             self.assertIsNotNone(cmd)
             ctx = FakeCtx()
             if name == "announce.done":
                 await cmd.callback(ctx, raw="")
+            elif name == "announce.prep_tomorrow_now":
+                await cmd.callback(ctx)
             else:
                 await cmd.callback(ctx, "")
             self.assertTrue(any("owner-only" in s.lower() for s in ctx.sent))

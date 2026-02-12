@@ -1,20 +1,41 @@
-# Production starter template for announcement automation (v1.1).
-# Fill channel IDs and enable the days you want.
-# Times are interpreted in `timezone` unless overridden by env.
+﻿# Production announcement automation config (v1.2) - Lumeris weekly schedule aware
+# Runtime override caveat:
+# `EPOXY_ANNOUNCE_TIMEZONE`, `EPOXY_ANNOUNCE_PREP_TIME_LOCAL`, and
+# `EPOXY_ANNOUNCE_PREP_CHANNEL_ID` (if set) take precedence over these YAML values.
+#
+# Current weekly cadence (same car/track unless noted):
+# Monday    - Core workshop / 90-minute training block
+# Tuesday   - Study hall / Q&A (follow-up to Monday, plus general driving questions)
+# Wednesday - Adaptability training (short stints + big condition variance)
+# Thursday  - Mastery Group Coaching (for Mastery drivers)
+# Friday    - Friday Funday (public minigames)
+# Saturday  - Racecraft training (format/participation may change)
+# Sunday    - Race Together + weekly orientation for the coming week
 timezone: UTC
-prep_time_local: "09:00"
-prep_channel_id: 0 # replace with prep channel id (thread host)
+prep_time_local: "22:00"
+prep_channel_id: 1412603858835738784 # thread host for prep pings
 prep_role_name: "" # optional role name to mention on prep ping
 days:
   monday:
+    # Core workshop / training block
     enabled: false # set true when configured
-    target_channel_id: 0 # replace with announcement destination channel id
-    publish_time_local: "16:00"
+    target_channel_id: 1410479714182631474 # replace with announcement destination channel id
+    publish_time_local: "06:00"
     tone: "Clear, concise, and operational."
     structure:
       - "Headline"
       - "Key Updates"
       - "Actions / Next Steps"
+    style_guidance:
+      notes: "This announcement is for the public channel, consider including additional context for non-members"
+      examples: []
+    # Optional style guidance example for LLM drafting (used as references only; never copied directly):
+    # style_guidance:
+    #   notes: "Prefer short, operational updates with concrete asks."
+    #   examples:
+    #     - id: "monday_ops_ref"
+    #       summary: "compact update format"
+    #       text: "Quick ops update: [headline]. Key updates: [points]. Actions: [asks]."
     questions:
       - id: "headline"
         prompt: "What is the one-line headline for tomorrow?"
@@ -26,14 +47,18 @@ days:
         prompt: "What actions or asks should members take?"
         required: false
   tuesday:
+    # Study hall / Q&A - follow-up to Monday
     enabled: false
-    target_channel_id: 0
-    publish_time_local: "16:00"
+    target_channel_id: 1414715192448909323
+    publish_time_local: "06:00"
     tone: "Supportive and specific."
     structure:
       - "Opening"
       - "Progress"
       - "What We Need"
+    style_guidance:
+      notes: ""
+      examples: []
     questions:
       - id: "opening"
         prompt: "What is the opening context for tomorrow?"
@@ -45,14 +70,18 @@ days:
         prompt: "What support or responses do we need?"
         required: false
   wednesday:
+    # Adaptability training (conditions variance)
     enabled: false
-    target_channel_id: 0
-    publish_time_local: "16:00"
+    target_channel_id: 1410479714182631474
+    publish_time_local: "06:00"
     tone: "Calm, grounded, and practical."
     structure:
       - "Context"
       - "Main Points"
       - "Timing / Logistics"
+    style_guidance:
+      notes: ""
+      examples: []
     questions:
       - id: "context"
         prompt: "What context is essential for tomorrow?"
@@ -64,14 +93,18 @@ days:
         prompt: "What timing or logistics should be included?"
         required: false
   thursday:
+    # Mastery Group Coaching (for Mastery drivers)
     enabled: false
-    target_channel_id: 0
-    publish_time_local: "16:00"
+    target_channel_id: 1410479714182631474
+    publish_time_local: "06:00"
     tone: "Direct and motivating."
     structure:
       - "Topline"
       - "Details"
       - "CTA"
+    style_guidance:
+      notes: ""
+      examples: []
     questions:
       - id: "topline"
         prompt: "What is the topline message?"
@@ -83,33 +116,96 @@ days:
         prompt: "What call-to-action should we include?"
         required: false
   friday:
+    # Friday Funday - public minigames
     enabled: false
-    target_channel_id: 0
-    publish_time_local: "16:00"
-    tone: "Warm and celebratory, with clear next actions."
+    target_channel_id: 1410479714182631474
+    publish_time_local: "06:00"
+    tone: "Playful, welcoming, and crystal clear about what's happening and how to join."
     structure:
-      - "Win / Highlight"
-      - "Summary"
-      - "Next"
+      - "What Friday Funday Is"
+      - "This Week's Minigames"
+      - "How to Join"
+    style_guidance:
+      notes: |
+        Use a friendly, public-facing voice.
+        Make it explicit that non-members are welcome as long as they bring good vibes.
+        Keep the focus on:
+          - what fun events are happening this week,
+          - what makes them fun,
+          - and exactly how/when to join.
+        Include at least one vivid "imagine this..." or similar mini-scenario line.
+        Close with:
+          - exact start time (Discord timestamp),
+          - where to join for comms,
+          - and where to ask questions if someone is unsure.
+      examples:
+        - id: "friday_funday_ref_1"
+          summary: "Playful public-facing Friday Funday announcement"
+          text: |
+            # Join us for Friday Funday!
+
+            *Friday Funday is your chance to unwind with some comedy racing and fun minigames. It doesn't matter if you're a Lumeris member or not - as long as you bring good vibes, you'll be welcomed with open arms.*
+
+            **:question: What are we doing this week?**
+
+            We have two exciting games planned for this week - Simon Says, and Bowling!!
+
+            =======================
+
+            :checkered_flag: **Minigame 1: Simon Says**
+
+            This one will require you to own the **Hockenheim Ring**.
+            We will be racing a super-secret (free) car, all while playing Simon Says.
+
+            > *Just imagine...*
+            > Simon Says no brakes allowed!
+            > Simon Says drive with one hand!
+
+            Controlled chaos from ridiculous mini-challenges will guarantee a few belly laughs.
+
+            =======================
+
+            :checkered_flag: **Minigame 2 - Bowling**
+
+            You will be put to the test on Lime Rock Park in an F4 car, all while trying to dodge the bowling balls!
+
+            Get ready for a race with a twist. We'll run a seemingly-normal race, but you'll have to weave and turn to avoid the bowling balls, who are trying to take you out!
+
+            *Who will make it through the race without being hit? Join to find out.*
+
+            =======================
+
+            Friday Funday will start at <t:1770316200:t>. Session names and passwords will be posted shortly before the event starts. Make sure to join us in https://discord.com/channels/1408224292604215340/1411275538978308246 for comms and minigame instructions!
+
+            Any questions? Just shoot a DM to @blockwood43 or ask in https://discord.com/channels/1408224292604215340/1408224293120380980 and we'll help you out.
+
+            We look forward to welcoming you on track.
     questions:
-      - id: "win"
-        prompt: "What win or highlight should we call out?"
+      - id: "vibe"
+        prompt: "In 1â€“2 sentences, what is the vibe or intention for this Friday Funday and who is it for (members, non-members, friends, etc.)?"
         required: true
-      - id: "summary"
-        prompt: "What summary points should be included?"
+      - id: "games"
+        prompt: "List each planned minigame with name, track, car(s), and a one- or two-sentence description of how it works and why itâ€™s fun."
         required: true
-      - id: "next"
-        prompt: "What are the next actions?"
+      - id: "logistics"
+        prompt: "What time does it start, what content is required (cars/tracks), and where should people go in Discord for comms, passwords, and questions?"
+        required: true
+      - id: "extra_flavor"
+        prompt: "Any extra flavor lines or silly example prompts youâ€™d like to include (e.g., 'Simon Says no brakes allowed')?"
         required: false
   saturday:
+    # Racecraft training (format/participation may change)
     enabled: false
-    target_channel_id: 0
-    publish_time_local: "12:00"
+    target_channel_id: 1410479714182631474
+    publish_time_local: "06:00"
     tone: "Light but still clear."
     structure:
       - "Update"
       - "Schedule"
       - "Optional Engagement"
+    style_guidance:
+      notes: ""
+      examples: []
     questions:
       - id: "update"
         prompt: "What update should we share?"
@@ -121,14 +217,18 @@ days:
         prompt: "Any optional engagement prompt?"
         required: false
   sunday:
+    # Race Together + weekly orientation for the coming week
     enabled: false
-    target_channel_id: 0
-    publish_time_local: "12:00"
+    target_channel_id: 1414715192448909323
+    publish_time_local: "06:00"
     tone: "Reflective and orienting."
     structure:
       - "Reflection"
       - "Plan Ahead"
       - "Reminders"
+    style_guidance:
+      notes: ""
+      examples: []
     questions:
       - id: "reflection"
         prompt: "What reflection or context is useful?"

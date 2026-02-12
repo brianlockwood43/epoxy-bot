@@ -229,6 +229,7 @@ ANNOUNCE_PREP_CHANNEL_ID = int(
 ANNOUNCE_PREP_ROLE_NAME = os.getenv("EPOXY_ANNOUNCE_PREP_ROLE_NAME", "").strip()
 ANNOUNCE_TICK_SECONDS = int(os.getenv("EPOXY_ANNOUNCE_TICK_SECONDS", "30").strip() or "30")
 ANNOUNCE_DRY_RUN = os.getenv("EPOXY_ANNOUNCE_DRY_RUN", "0").strip() == "1"
+# Deployment note: manage this via EPOXY_ANNOUNCE_TEMPLATES_PATH explicitly.
 ANNOUNCE_TEMPLATES_PATH = os.getenv("EPOXY_ANNOUNCE_TEMPLATES_PATH", announcement_templates_path_default())
 _RAW_DM_GUIDELINES_PATH = os.getenv("EPOXY_DM_GUIDELINES_PATH")
 DM_GUIDELINES_PATH = os.getenv(

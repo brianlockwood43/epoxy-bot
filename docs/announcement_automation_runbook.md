@@ -27,6 +27,7 @@ Edit `config/announcement_templates.yml`:
   - `enabled: true`
   - `target_channel_id`
   - `publish_time_local`
+  - `style_guidance` (optional style references)
   - question list (`id`, `prompt`, `required`)
 
 Notes:
@@ -69,6 +70,7 @@ Keep using owner approval gate:
 - `!announce.approve [YYYY-MM-DD]` (owner)
 - `!announce.unapprove [YYYY-MM-DD]` (owner)
 - `!announce.post_now [YYYY-MM-DD]` (owner)
+- `!announce.prep_tomorrow_now` (owner, sends tomorrow prep ping/thread early)
 
 Manual completion paths:
 
