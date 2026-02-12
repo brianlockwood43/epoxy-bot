@@ -100,6 +100,7 @@ class AnnouncementService:
 
         self._templates_cache: dict[str, Any] | None = None
         self._templates_mtime: float | None = None
+        self._templates_file_path: Path | None = None
 
     @staticmethod
     def _parse_hhmm(value: str) -> tuple[int, int]:
@@ -130,10 +131,55 @@ class AnnouncementService:
             return self._tomorrow_local_str()
         return self._today_local_str()
 
+    @staticmethod
+    def _repo_root() -> Path:
+        return Path(__file__).resolve().parents[2]
+
+    def _template_path_candidates(self) -> list[Path]:
+        raw = str(self.templates_path or "").strip()
+        if not raw:
+            return []
+        p = Path(raw)
+        out: list[Path] = []
+
+        def add(path: Path) -> None:
+            try:
+                normalized = path.resolve(strict=False)
+            except Exception:
+                normalized = path
+            for existing in out:
+                try:
+                    if normalized.samefile(existing):  # pragma: no cover - only when both paths exist
+                        return
+                except Exception:
+                    pass
+                if str(normalized) == str(existing):
+                    return
+            out.append(normalized)
+
+        add(p)
+        if not p.is_absolute():
+            add(Path.cwd() / p)
+            repo_root = self._repo_root()
+            add(repo_root / p)
+            add(repo_root / "config" / p.name)
+        return out
+
+    def _resolve_templates_file_path(self) -> Path:
+        candidates = self._template_path_candidates()
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        attempted = ", ".join(str(p) for p in candidates) or "<none>"
+        raise RuntimeError(
+            "Announcement template file not found: "
+            f"{self.templates_path} (attempted: {attempted}). "
+            "Set EPOXY_ANNOUNCE_TEMPLATES_PATH to an absolute path or repo-relative config path."
+        )
+
     def _read_templates(self) -> dict[str, Any]:
-        path = Path(self.templates_path)
-        if not path.exists():
-            raise RuntimeError(f"Announcement template file not found: {self.templates_path}")
+        path = self._resolve_templates_file_path()
+        self._templates_file_path = path
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if not isinstance(raw, dict):
             raise RuntimeError("Announcement templates file must contain a top-level mapping")
@@ -206,8 +252,12 @@ class AnnouncementService:
         return merged
 
     def _templates(self, force_reload: bool = False) -> dict[str, Any]:
-        path = Path(self.templates_path)
-        mtime = path.stat().st_mtime if path.exists() else None
+        path = self._templates_file_path
+        if path is None:
+            direct = Path(self.templates_path)
+            if direct.exists():
+                path = direct
+        mtime = path.stat().st_mtime if path is not None and path.exists() else None
         if (
             not force_reload
             and self._templates_cache is not None
@@ -218,8 +268,9 @@ class AnnouncementService:
 
         raw = self._read_templates()
         data = self._normalize_templates(raw)
+        loaded_path = self._templates_file_path
         self._templates_cache = data
-        self._templates_mtime = mtime
+        self._templates_mtime = loaded_path.stat().st_mtime if loaded_path is not None and loaded_path.exists() else None
         return data
 
     def reload_templates(self) -> dict[str, Any]:

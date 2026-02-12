@@ -117,7 +117,7 @@ days:
         required: false
   friday:
     # Friday Funday - public minigames
-    enabled: false
+    enabled: true
     target_channel_id: 1410479714182631474
     publish_time_local: "06:00"
     tone: "Playful, welcoming, and crystal clear about what's happening and how to join."

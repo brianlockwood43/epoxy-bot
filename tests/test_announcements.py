@@ -143,6 +143,29 @@ class AnnouncementMigrationTests(unittest.TestCase):
         actual = str(Path(default_templates_path()).resolve())
         self.assertEqual(actual, expected)
 
+    def test_templates_loader_basename_falls_back_to_repo_config(self):
+        svc = AnnouncementService(
+            db_lock=asyncio.Lock(),
+            db_conn=None,
+            client=_DummyClient("x"),
+            openai_model="gpt-5.1",
+            stage_at_least=lambda stage: True,
+            recall_memory_func=_recall_none,
+            format_memory_for_llm=_fmt_memory,
+            utc_iso=lambda dt=None: (dt or datetime.now(timezone.utc)).isoformat(),
+            templates_path="announcement_templates.yml",
+            enabled=True,
+            timezone_name="UTC",
+            prep_time_local="00:00",
+            prep_channel_id=0,
+            prep_role_name="",
+            dry_run=True,
+        )
+        data = svc.reload_templates()
+        self.assertIsInstance(data, dict)
+        self.assertIn("days", data)
+        self.assertIn("monday", data.get("days") or {})
+
 
 class AnnouncementServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
