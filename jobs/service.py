@@ -1,12 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
+
+
+def _canonical_summary_scope(scope: str | None) -> str:
+    text = (scope or "").strip().lower()
+    if not text:
+        return "global"
+
+    channel_match = re.search(r"\bchannel:(\d{1,20})\b", text)
+    if channel_match:
+        return f"channel:{int(channel_match.group(1))}"
+
+    guild_match = re.search(r"\bguild:(\d{1,20})\b", text)
+    if guild_match:
+        return f"guild:{int(guild_match.group(1))}"
+
+    return "global"
 
 
 async def summarize_topic(
     topic_id: str,
     *,
+    scope: str = "auto",
+    summary_type: str = "topic_gist",
     min_age_days: int = 14,
     stage_at_least,
     db_lock,
@@ -27,10 +46,12 @@ async def summarize_topic(
     topic_id = (topic_id or "").strip().lower()
     if not topic_id:
         return "Missing topic_id."
+    summary_type = (summary_type or "").strip() or "topic_gist"
+    scope = (scope or "auto").strip() or "auto"
 
     async with db_lock:
-        existing = await asyncio.to_thread(get_topic_summary_sync, db_conn, topic_id)
-        events = await asyncio.to_thread(fetch_topic_events_sync, db_conn, topic_id, min_age_days, 200)
+        existing = await asyncio.to_thread(get_topic_summary_sync, db_conn, topic_id, scope, summary_type)
+        events = await asyncio.to_thread(fetch_topic_events_sync, db_conn, topic_id, scope, min_age_days, 200)
 
     if not events:
         if existing:
@@ -85,6 +106,8 @@ async def summarize_topic(
     tags = normalize_tags([topic_id])
     payload = {
         "topic_id": topic_id,
+        "scope": _canonical_summary_scope(scope),
+        "summary_type": summary_type,
         "created_at_utc": utc_iso(),
         "updated_at_utc": utc_iso(),
         "start_ts": int(start_ts),
@@ -120,9 +143,12 @@ async def maintenance_loop(
     while True:
         try:
             async with db_lock:
-                deleted_events, _ = await asyncio.to_thread(cleanup_memory_sync, db_conn)
-            if deleted_events:
-                print(f"[Memory] cleanup deleted_events={deleted_events} stage={memory_stage}")
+                transitioned_events, transitioned_summaries = await asyncio.to_thread(cleanup_memory_sync, db_conn)
+            if transitioned_events or transitioned_summaries:
+                print(
+                    "[Memory] cleanup transitions "
+                    f"events={transitioned_events} summaries={transitioned_summaries} stage={memory_stage}"
+                )
 
             if auto_summary and stage_at_least("M3"):
                 cutoff = int(time.time()) - min_age_days * 86400
@@ -131,6 +157,7 @@ async def maintenance_loop(
                         lambda c: c.execute(
                             "SELECT topic_id, COUNT(*) as n FROM memory_events "
                             "WHERE importance=1 AND summarized=0 AND created_ts < ? "
+                            "AND COALESCE(lifecycle, 'active')='active' "
                             "AND topic_id IS NOT NULL AND topic_id != '' "
                             "GROUP BY topic_id ORDER BY n DESC LIMIT 2",
                             (cutoff,),
@@ -146,4 +173,3 @@ async def maintenance_loop(
             print(f"[Memory] maintenance loop error: {e}")
 
         await asyncio.sleep(max(60, int(interval_seconds)))
-

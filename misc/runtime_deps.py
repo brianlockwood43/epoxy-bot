@@ -39,6 +39,9 @@ class RuntimeDeps:
     infer_scope: Callable[[str], str]
     recall_memory_func: Callable
     format_memory_for_llm: Callable
+    resolve_policy_bundle_sync: Callable
+    format_policy_directive_func: Callable
+    apply_policy_enforcement_func: Callable
     recall_profile_for_identity_func: Callable
     format_profile_for_llm: Callable
     dm_guidelines: Any

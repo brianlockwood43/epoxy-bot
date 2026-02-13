@@ -724,6 +724,133 @@ Autonomy, but with guardrails and measurable drift control.
 
 ---
 
+### Future Work: Community State Dashboards (Meta-Meta Layer)
+
+**Stage:** Post M4 (later-phase enhancement, not part of current M3 → M4 scope)  
+**Status:** Intent documented; design direction sketched, not implemented.
+
+---
+
+#### Goal
+
+Introduce a **community state “dashboard” layer** on top of Epoxy’s existing meta-memory that can summarize the *vibe/health of the community* over time, without becoming a new source of ground-truth or directly driving behavior.
+
+Think of these as **aggregated health indicators and trend summaries**, derived from existing episodes + meta (people arcs, org arcs, etc.), primarily for **human operators** and higher-level analysis.
+
+---
+
+#### Key Properties
+
+- **Aggregated, not individual**
+  - Dashboards operate on **groups/cohorts**, not on single people.
+  - Examples:
+    - `community_state:lumeris_overall`
+    - `cohort_state:mastery_drivers`
+    - `cohort_state:new_joiners_last_60d`
+
+- **Time-bounded and explicitly scoped**
+  - Each dashboard item is tied to a **time window**:
+    - `window_start`, `window_end`, `computed_at`.
+  - No “forever true” vibe statements; they always answer “during this period.”
+
+- **Provenance-aware**
+  - Each dashboard explicitly records **how it was computed**:
+    - which metrics,
+    - which meta types (person cores, arcs, etc.),
+    - example episodes or aggregates used.
+  - Always includes references like `ref: meta:<id>` and/or aggregate counts instead of opaque magic.
+
+- **Ephemeral influence by default**
+  - **Default rule:** dashboards **do not influence Epoxy’s behavior directly**.
+  - They are used as **operator-facing instrumentation**, not as hidden priors.
+  - Any behavior changes based on dashboards must be **introduced via human-reviewed policy/meta changes**, not automatically.
+
+- **Low-frequency updates**
+  - Updated on a **scheduled basis** (e.g. daily/weekly) or at operator-triggered checkpoints.
+  - Emphasis on **trend tracking** rather than fast-reactive behavior.
+
+---
+
+#### Example Shape (Conceptual)
+
+A `MetaItem(kind='community_state')` might include:
+
+- Time window and identifiers:
+  - `window_start`, `window_end`, `computed_at`,
+  - `scope` (e.g. `community:lumeris`, `cohort:mastery`).
+- A small set of **health indicators** (normalized 0–1 or low/med/high):
+  - trust/safety,
+  - tension/conflict level,
+  - burnout/fatigue risk,
+  - cohesion/alignment.
+- **Top themes**:
+  - short descriptions of dominant narratives (e.g. “boundary recalibration,” “money stress,” “excitement about Epoxy”).
+- **Provenance**:
+  - references to metrics, meta, or summary episodes used (counts, IDs, or tags).
+
+These are **summaries with links**, not standalone truth.
+
+---
+
+#### Intended Use
+
+- Give Brian and other operators a **high-level read** on how the community is doing over time.
+- Support:
+  - deciding what workshops or communications to prioritize,
+  - retro analysis (“what did the vibe look like before/after event X?”),
+  - designing policy/meta changes for Epoxy’s behavior.
+
+- Epoxy may:
+  - **surface dashboards explicitly when asked** (e.g. “show me current community_state”),
+  - or use them **only via human-confirmed policies** (e.g. “for the next month, treat community as in a fragile integration phase”).
+
+---
+
+#### Explicit Non-Goals (Guardrails)
+
+- **No automatic behavioral control**
+  - Dashboards must **not autonomously change** relational contracts, policies, or tone rules.
+  - Any behavior shifts require **human-reviewed updates** to:
+    - policy meta,
+    - relational contracts,
+    - or controller config.
+
+- **No storing per-person judgements here**
+  - Individual people’s arcs and states remain in:
+    - `person_core`,
+    - `narrative`,
+    - and related per-person meta.
+  - Community dashboards only describe **aggregated patterns**, never “this person is X.”
+
+- **No hardcoding narratives about Lumeris**
+  - Dashboards should be treated as **snapshots with uncertainty**, not permanent story tiles.
+  - Retrieval/UI should highlight **time window + confidence**, not present them as timeless truths.
+
+---
+
+#### Implementation Approach (Later)
+
+1. **Start with ephemeral evaluators**
+   - Implement a `community_health_eval` step that computes **in-memory** health metrics from:
+     - existing meta,
+     - recent episodes,
+     - simple numeric counters.
+   - Use it for operator-facing output and manual review.
+
+2. **If useful, introduce persistent dashboards**
+   - Add `MetaItem(kind='community_state')` and related types.
+   - Store selected, human-reviewed summaries as long-lived objects, with full provenance + time windows.
+
+3. **Wire into operator tools, not controller behavior**
+   - Integrate dashboards into:
+     - admin/owner commands,
+     - monitoring views,
+     - and planning docs.
+   - Only later, if desired, allow **explicit, human-authored policies** to reference dashboard metrics.
+
+---
+
+
 ## Conflict resolution (define it early; enforce it always)
 
 A simple priority stack that prevents weird behavior across both memory and controller:

@@ -221,6 +221,11 @@ async def remember_event(
     payload = {
         "created_at_utc": utc_iso(created_dt) if created_dt else utc_iso(),
         "created_ts": created_ts,
+        "scope": (
+            f"channel:{int(channel_id)}"
+            if channel_id is not None
+            else (f"guild:{int(guild_id)}" if guild_id is not None else "global")
+        ),
         "guild_id": guild_id,
         "channel_id": channel_id,
         "channel_name": channel_name,
@@ -255,4 +260,3 @@ async def remember_event(
         "topic_confidence": topic_confidence,
         "tags": tags,
     }
-

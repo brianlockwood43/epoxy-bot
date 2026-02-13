@@ -5,7 +5,47 @@ import hashlib
 import re
 
 
-def budget_and_diversify_events(events: list[dict], scope: str, *, stage_at_least, limit: int = 8) -> list[dict]:
+def _coerce_nonneg_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = int(default)
+    return max(0, parsed)
+
+
+def normalize_memory_budget(memory_budget: dict | None, *, stage_at_least) -> tuple[dict[int, int], int, int, int]:
+    """
+    Convert controller memory_budget to concrete retrieval limits.
+
+    Returns:
+      (tier_caps, event_limit, summary_limit, event_search_limit)
+    """
+    defaults = {"hot": 4, "warm": 3, "cold": 1, "summaries": 2}
+    raw = memory_budget if isinstance(memory_budget, dict) else {}
+
+    hot = _coerce_nonneg_int(raw.get("hot"), defaults["hot"])
+    warm = _coerce_nonneg_int(raw.get("warm"), defaults["warm"])
+    cold = _coerce_nonneg_int(raw.get("cold"), defaults["cold"])
+    summaries = _coerce_nonneg_int(raw.get("summaries"), defaults["summaries"])
+
+    tier_caps = {0: hot, 1: warm, 2: cold, 3: 0}
+    event_limit = hot + warm + cold
+    if event_limit <= 0:
+        event_limit = defaults["hot"] + defaults["warm"] + defaults["cold"]
+
+    summary_limit = summaries if stage_at_least("M3") else 0
+    event_search_limit = max(20, event_limit * 5)
+    return (tier_caps, event_limit, summary_limit, event_search_limit)
+
+
+def budget_and_diversify_events(
+    events: list[dict],
+    scope: str,
+    *,
+    stage_at_least,
+    limit: int = 8,
+    tier_caps: dict[int, int] | None = None,
+) -> list[dict]:
     """
     Apply simple budgets to reduce near-duplicates and keep a healthy mix.
 
@@ -45,7 +85,15 @@ def budget_and_diversify_events(events: list[dict], scope: str, *, stage_at_leas
 
         return {0: hot, 1: warm, 2: cold, 3: 0}
 
-    caps = _tier_caps(limit) if stage_at_least("M2") else {0: limit, 1: limit, 2: limit, 3: limit}
+    if stage_at_least("M2") and tier_caps is not None:
+        caps = {
+            0: max(0, int(tier_caps.get(0, 0))),
+            1: max(0, int(tier_caps.get(1, 0))),
+            2: max(0, int(tier_caps.get(2, 0))),
+            3: max(0, int(tier_caps.get(3, 0))),
+        }
+    else:
+        caps = _tier_caps(limit) if stage_at_least("M2") else {0: limit, 1: limit, 2: limit, 3: limit}
     tier_counts: dict[int, int] = {}
 
     def _fp(e: dict) -> str:
@@ -103,6 +151,7 @@ def budget_and_diversify_events(events: list[dict], scope: str, *, stage_at_leas
 async def recall_memory(
     prompt: str,
     scope: str | None = None,
+    memory_budget: dict | None = None,
     *,
     stage_at_least,
     db_lock,
@@ -114,12 +163,22 @@ async def recall_memory(
         return ([], [])
 
     scope = (scope or ("auto" if stage_at_least("M2") else "auto"))
+    tier_caps, event_limit, summary_limit, event_search_limit = normalize_memory_budget(
+        memory_budget,
+        stage_at_least=stage_at_least,
+    )
     async with db_lock:
-        events = await asyncio.to_thread(search_memory_events_sync, db_conn, prompt, scope, 40)
-        events = budget_and_diversify_events(events, scope, stage_at_least=stage_at_least, limit=8)
+        events = await asyncio.to_thread(search_memory_events_sync, db_conn, prompt, scope, event_search_limit)
+        events = budget_and_diversify_events(
+            events,
+            scope,
+            stage_at_least=stage_at_least,
+            limit=event_limit,
+            tier_caps=tier_caps,
+        )
         summaries = []
-        if stage_at_least("M3"):
-            summaries = await asyncio.to_thread(search_memory_summaries_sync, db_conn, prompt, 3)
+        if stage_at_least("M3") and summary_limit > 0:
+            summaries = await asyncio.to_thread(search_memory_summaries_sync, db_conn, prompt, scope, summary_limit)
     return (events, summaries)
 
 

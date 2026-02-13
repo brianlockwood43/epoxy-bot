@@ -64,6 +64,9 @@ from ingestion.store import set_backfill_done_sync as set_backfill_done_store
 from jobs.service import maintenance_loop as maintenance_loop_service
 from jobs.service import summarize_topic as summarize_topic_service
 from jobs.announcements import announcement_loop as announcement_loop_service
+from memory.meta_service import apply_policy_enforcement as apply_policy_enforcement_service
+from memory.meta_service import format_policy_directive as format_policy_directive_service
+from memory.meta_store import resolve_policy_bundle_sync as resolve_policy_bundle_store
 from memory.service import extract_json_array as extract_json_array_service
 from memory.service import get_topic_candidates as get_topic_candidates_service
 from memory.service import remember_event as remember_event_service
@@ -726,30 +729,83 @@ def _search_memory_events_sync(conn: sqlite3.Connection, query: str, scope: str,
         safe_json_loads=safe_json_loads,
     )
 
-def _search_memory_summaries_sync(conn: sqlite3.Connection, query: str, limit: int = 3) -> list[dict]:
+def _search_memory_summaries_sync(conn: sqlite3.Connection, query: str, scope: str, limit: int = 3) -> list[dict]:
     return search_memory_summaries_store(
         conn,
         query,
+        scope,
         limit=limit,
         build_fts_query=build_fts_query,
+        parse_recall_scope=parse_recall_scope,
         safe_json_loads=safe_json_loads,
+    )
+
+def _resolve_policy_bundle_sync(
+    conn: sqlite3.Connection,
+    *,
+    sensitivity_policy_id: str,
+    caller_type: str,
+    surface: str,
+    limit: int = 20,
+) -> dict:
+    return resolve_policy_bundle_store(
+        conn,
+        sensitivity_policy_id=sensitivity_policy_id,
+        caller_type=caller_type,
+        surface=surface,
+        limit=limit,
+    )
+
+def _format_policy_directive(policy_bundle: dict, max_chars: int = 550) -> str:
+    return format_policy_directive_service(policy_bundle, max_chars=max_chars)
+
+def _apply_policy_enforcement(
+    reply: str,
+    *,
+    policy_bundle: dict,
+    author_id: int | None,
+    caller_type: str,
+    surface: str,
+) -> tuple[str, list[str]]:
+    return apply_policy_enforcement_service(
+        reply,
+        policy_bundle=policy_bundle,
+        author_id=author_id,
+        caller_type=caller_type,
+        surface=surface,
     )
 
 def _cleanup_memory_sync(conn: sqlite3.Connection) -> tuple[int, int]:
     return cleanup_memory_store(conn, stage_at_least=stage_at_least)
-def _fetch_topic_events_sync(conn: sqlite3.Connection, topic_id: str, min_age_days: int = 14, max_events: int = 200) -> list[dict]:
+def _fetch_topic_events_sync(
+    conn: sqlite3.Connection,
+    topic_id: str,
+    scope: str = "auto",
+    min_age_days: int = 14,
+    max_events: int = 200,
+) -> list[dict]:
     return fetch_topic_events_store(
         conn,
         topic_id,
+        scope=scope,
         min_age_days=min_age_days,
         max_events=max_events,
+        parse_recall_scope=parse_recall_scope,
         safe_json_loads=safe_json_loads,
     )
 
-def _get_topic_summary_sync(conn: sqlite3.Connection, topic_id: str) -> dict | None:
+def _get_topic_summary_sync(
+    conn: sqlite3.Connection,
+    topic_id: str,
+    scope: str = "auto",
+    summary_type: str = "topic_gist",
+) -> dict | None:
     return get_topic_summary_store(
         conn,
         topic_id,
+        scope=scope,
+        summary_type=summary_type,
+        parse_recall_scope=parse_recall_scope,
         safe_json_loads=safe_json_loads,
     )
 
@@ -956,10 +1012,15 @@ def _budget_and_diversify_events(events: list[dict], scope: str, limit: int = 8)
         limit=limit,
     )
 
-async def recall_memory(prompt: str, scope: str | None = None) -> tuple[list[dict], list[dict]]:
+async def recall_memory(
+    prompt: str,
+    scope: str | None = None,
+    memory_budget: dict | None = None,
+) -> tuple[list[dict], list[dict]]:
     return await recall_memory_service(
         prompt,
         scope,
+        memory_budget,
         stage_at_least=stage_at_least,
         db_lock=db_lock,
         db_conn=db_conn,
@@ -973,9 +1034,17 @@ def format_memory_for_llm(events: list[dict], summaries: list[dict], max_chars: 
 def format_profile_for_llm(user_blocks: list[tuple[int, str, list[dict]]], max_chars: int = 900) -> str:
     return format_profile_for_llm_service(user_blocks, max_chars=max_chars)
 
-async def summarize_topic(topic_id: str, *, min_age_days: int = 14) -> str:
+async def summarize_topic(
+    topic_id: str,
+    *,
+    scope: str = "auto",
+    summary_type: str = "topic_gist",
+    min_age_days: int = 14,
+) -> str:
     return await summarize_topic_service(
         topic_id,
+        scope=scope,
+        summary_type=summary_type,
         min_age_days=min_age_days,
         stage_at_least=stage_at_least,
         db_lock=db_lock,
@@ -1103,6 +1172,9 @@ wire_bot_runtime(
     infer_scope=infer_scope,
     recall_memory_func=recall_memory,
     format_memory_for_llm=format_memory_for_llm,
+    resolve_policy_bundle_sync=_resolve_policy_bundle_sync,
+    format_policy_directive_func=_format_policy_directive,
+    apply_policy_enforcement_func=_apply_policy_enforcement,
     subject_user_tag=subject_user_tag,
     subject_person_tag=subject_person_tag,
     get_or_create_person_sync=get_or_create_person_sync,

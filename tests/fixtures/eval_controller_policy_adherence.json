@@ -1,0 +1,53 @@
+{
+  "cases": [
+    {
+      "name": "member_public_redacts_other_mentions",
+      "sensitivity_policy_id": "policy:member_privacy",
+      "caller_type": "member",
+      "surface": "public_channel",
+      "author_id": 111111111,
+      "reply": "Please ask <@222222222> to share their private notes.",
+      "min_policy_count": 1,
+      "required_enforcement_flags": [
+        "no_cross_member_private_disclosure",
+        "redact_discord_mentions_in_member_context"
+      ],
+      "required_clamps": ["redact_discord_mentions"],
+      "expect_reply_changed": true,
+      "required_substrings": ["[redacted-user]"],
+      "forbidden_substrings": ["<@222222222>"],
+      "directive_must_include": [
+        "Policy constraints",
+        "Do not reveal private information about other members"
+      ]
+    },
+    {
+      "name": "founder_dm_keeps_mentions",
+      "sensitivity_policy_id": "policy:leadership_confidential",
+      "caller_type": "founder",
+      "surface": "dm",
+      "author_id": 111111111,
+      "reply": "Coordinate with <@222222222> directly.",
+      "min_policy_count": 1,
+      "required_clamps": [],
+      "expect_reply_changed": false,
+      "required_substrings": ["<@222222222>"],
+      "directive_must_include": [
+        "Leadership contexts can include cross-member analysis"
+      ]
+    },
+    {
+      "name": "external_public_preserves_author_mention_only",
+      "sensitivity_policy_id": "policy:public_safe",
+      "caller_type": "external",
+      "surface": "public_channel",
+      "author_id": 111111111,
+      "reply": "I can follow up with you <@111111111> and loop in <@222222222>.",
+      "required_clamps": ["redact_discord_mentions"],
+      "expect_reply_changed": true,
+      "required_substrings": ["<@111111111>", "[redacted-user]"],
+      "forbidden_substrings": ["<@222222222>"]
+    }
+  ]
+}
+

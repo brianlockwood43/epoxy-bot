@@ -91,6 +91,45 @@ def _normalize_dm_field_list(values: list[str]) -> list[str]:
     return out
 
 
+def _compose_recall_scope(
+    *,
+    temporal_scope: str | None,
+    channel_id: int | None,
+    guild_id: int | None,
+) -> str:
+    temporal = str(temporal_scope or "auto").strip().lower()
+    if temporal not in {"hot", "warm", "cold", "auto"}:
+        temporal = "auto"
+
+    tokens = [temporal]
+    if channel_id is not None:
+        tokens.append(f"channel:{int(channel_id)}")
+    if guild_id is not None:
+        tokens.append(f"guild:{int(guild_id)}")
+    return " ".join(tokens)
+
+
+def _controller_memory_budget(controller_cfg: dict | None) -> dict[str, int]:
+    raw = controller_cfg.get("memory_budget") if isinstance(controller_cfg, dict) else {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def _as_nonneg_int(value: object, default: int) -> int:
+        try:
+            out = int(value)
+        except Exception:
+            out = int(default)
+        return max(0, out)
+
+    return {
+        "hot": _as_nonneg_int(raw.get("hot"), 4),
+        "warm": _as_nonneg_int(raw.get("warm"), 3),
+        "cold": _as_nonneg_int(raw.get("cold"), 1),
+        "summaries": _as_nonneg_int(raw.get("summaries"), 2),
+        "meta": _as_nonneg_int(raw.get("meta"), 0),
+    }
+
+
 def _build_prompt_fingerprint(
     *,
     target: str | None,
@@ -352,6 +391,15 @@ def register_runtime_events(
                         user_id=int(message.author.id),
                         person_id=int(actor_person_id),
                     )
+                    policy_bundle = await asyncio.to_thread(
+                        deps.resolve_policy_bundle_sync,
+                        deps.db_conn,
+                        sensitivity_policy_id=runtime_ctx["sensitivity_policy_id"],
+                        caller_type=runtime_ctx["caller_type"],
+                        surface=runtime_ctx["surface"],
+                    )
+                memory_budget = _controller_memory_budget(controller_cfg)
+                policy_directive = deps.format_policy_directive_func(policy_bundle, max_chars=550)
 
                 route = classify_mention_route(safe_prompt)
 
@@ -564,8 +612,17 @@ def register_runtime_events(
                     recall_query_parts.extend(req.my_goals)
                     recall_query_parts.extend(req.non_negotiables)
                     recall_query = " ".join(part.strip() for part in recall_query_parts if str(part).strip()) or dm_payload
-                    recall_scope = deps.infer_scope(recall_query) if deps.stage_at_least("M2") else "auto"
-                    events, summaries = await deps.recall_memory_func(recall_query, scope=recall_scope)
+                    temporal_scope = deps.infer_scope(recall_query) if deps.stage_at_least("M2") else "auto"
+                    recall_scope = _compose_recall_scope(
+                        temporal_scope=temporal_scope,
+                        channel_id=(int(message.channel.id) if hasattr(message.channel, "id") else None),
+                        guild_id=(int(message.guild.id) if message.guild else None),
+                    )
+                    events, summaries = await deps.recall_memory_func(
+                        recall_query,
+                        scope=recall_scope,
+                        memory_budget=memory_budget,
+                    )
                     retrieved_memory_ids = [int(e["id"]) for e in events if e.get("id") is not None]
                     memory_pack = deps.format_memory_for_llm(events, summaries, max_chars=max_msg_content)[:max_msg_content]
 
@@ -634,6 +691,13 @@ def register_runtime_events(
                         recall_count=recall_count,
                     )
                     reply = format_dm_result_for_discord(run)
+                    reply, applied_policy_clamps = deps.apply_policy_enforcement_func(
+                        reply,
+                        policy_bundle=policy_bundle,
+                        author_id=int(message.author.id),
+                        caller_type=runtime_ctx["caller_type"],
+                        surface=runtime_ctx["surface"],
+                    )
                     await deps.send_chunked(message.channel, reply)
 
                     if deps.enable_episode_logging and should_log_episode(deps.episode_log_filters, runtime_ctx):
@@ -707,6 +771,9 @@ def register_runtime_events(
                                 "profile_hits": len(profile_events),
                                 "recall_coverage_count": int(recall_count),
                                 "recall_provenance_counts": dict(recall_provenance_counts),
+                                "memory_budget": dict(memory_budget),
+                                "resolved_policy_ids": list(policy_bundle.get("policy_ids", [])),
+                                "applied_policy_clamps": list(applied_policy_clamps),
                                 "target_user_id": target_fields["target_user_id"],
                                 "target_person_id": target_fields["target_person_id"],
                                 "target_display_name": target_fields["target_display_name"],
@@ -740,12 +807,20 @@ def register_runtime_events(
                             await asyncio.to_thread(deps.insert_episode_log_sync, deps.db_conn, episode_payload)
                     return
 
+                temporal_scope = deps.infer_scope(safe_prompt) if deps.stage_at_least("M2") else "auto"
+                recall_scope = _compose_recall_scope(
+                    temporal_scope=temporal_scope,
+                    channel_id=(int(message.channel.id) if hasattr(message.channel, "id") else None),
+                    guild_id=(int(message.guild.id) if message.guild else None),
+                )
                 events, summaries, retrieved_memory_ids, memory_pack = await maybe_build_memory_pack(
                     stage_at_least=deps.stage_at_least,
                     infer_scope=deps.infer_scope,
                     recall_memory_func=deps.recall_memory_func,
                     format_memory_for_llm=deps.format_memory_for_llm,
                     safe_prompt=safe_prompt,
+                    scope=recall_scope,
+                    memory_budget=memory_budget,
                     max_chars=max_msg_content,
                 )
 
@@ -753,7 +828,8 @@ def register_runtime_events(
                     f"[CTX] channel={message.channel.id} rows={ctx_rows} before={message.id} "
                     f"ctx_chars={len(recent_context)} pack_chars={len(context_pack)} prompt_chars={len(safe_prompt)} "
                     f"mem_chars={len(memory_pack)} stage={deps.memory_stage} limit={deps.recent_context_limit} "
-                    f"context={runtime_ctx['caller_type']}/{runtime_ctx['surface']} cfg={controller_cfg.get('scope','global')}"
+                    f"context={runtime_ctx['caller_type']}/{runtime_ctx['surface']} cfg={controller_cfg.get('scope','global')} "
+                    f"budget=hot:{memory_budget.get('hot', 0)}/warm:{memory_budget.get('warm', 0)}/cold:{memory_budget.get('cold', 0)}/sum:{memory_budget.get('summaries', 0)}"
                 )
 
                 instructions = (
@@ -780,6 +856,8 @@ def register_runtime_events(
                     f"intervention={controller_cfg.get('intervention_level', 0.35):.2f}. "
                     "Never reveal another member's private information in member/public contexts."
                 )[:max_msg_content]
+                if policy_directive:
+                    controller_directive = f"{controller_directive}\n{policy_directive}"[:max_msg_content]
 
                 chat_messages = build_chat_messages(
                     system_prompt_base=deps.system_prompt_base,
@@ -799,6 +877,13 @@ def register_runtime_events(
                     messages=chat_messages,
                 )
                 reply = (resp.choices[0].message.content or "(no output)")
+                reply, applied_policy_clamps = deps.apply_policy_enforcement_func(
+                    reply,
+                    policy_bundle=policy_bundle,
+                    author_id=int(message.author.id),
+                    caller_type=runtime_ctx["caller_type"],
+                    surface=runtime_ctx["surface"],
+                )
                 await deps.send_chunked(message.channel, reply)
 
                 if deps.enable_episode_logging and should_log_episode(deps.episode_log_filters, runtime_ctx):
@@ -817,7 +902,13 @@ def register_runtime_events(
                             f"group:{runtime_ctx['channel_policy_group']}",
                             f"actor_person:{int(actor_person_id)}",
                         ],
-                        "implicit_signals": {"ctx_rows": int(ctx_rows), "memory_hits": len(retrieved_memory_ids)},
+                        "implicit_signals": {
+                            "ctx_rows": int(ctx_rows),
+                            "memory_hits": len(retrieved_memory_ids),
+                            "memory_budget": dict(memory_budget),
+                            "resolved_policy_ids": list(policy_bundle.get("policy_ids", [])),
+                            "applied_policy_clamps": list(applied_policy_clamps),
+                        },
                         "guild_id": int(message.guild.id) if message.guild else None,
                         "channel_id": int(message.channel.id) if hasattr(message.channel, "id") else None,
                         "message_id": int(message.id),

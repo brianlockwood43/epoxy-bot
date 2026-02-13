@@ -1,0 +1,226 @@
+{
+  "stage": "M3",
+  "events": [
+    {
+      "id": 1,
+      "scope": "channel:100",
+      "guild_id": 1,
+      "channel_id": 100,
+      "channel_name": "chan-100",
+      "author_id": 10,
+      "author_name": "alpha",
+      "text": "alphakey hot memory",
+      "tags": ["alphakey"],
+      "importance": 1,
+      "tier": 0,
+      "lifecycle": "active",
+      "topic_id": "ops"
+    },
+    {
+      "id": 2,
+      "scope": "channel:100",
+      "guild_id": 1,
+      "channel_id": 100,
+      "channel_name": "chan-100",
+      "author_id": 11,
+      "author_name": "beta",
+      "text": "alphakey warm memory",
+      "tags": ["alphakey"],
+      "importance": 0,
+      "tier": 1,
+      "lifecycle": "active",
+      "topic_id": "ops"
+    },
+    {
+      "id": 3,
+      "scope": "channel:100",
+      "guild_id": 1,
+      "channel_id": 100,
+      "channel_name": "chan-100",
+      "author_id": 12,
+      "author_name": "gamma",
+      "text": "alphakey cold memory",
+      "tags": ["alphakey"],
+      "importance": 0,
+      "tier": 2,
+      "lifecycle": "active",
+      "topic_id": "ops"
+    },
+    {
+      "id": 4,
+      "scope": "channel:200",
+      "guild_id": 1,
+      "channel_id": 200,
+      "channel_name": "chan-200",
+      "author_id": 13,
+      "author_name": "delta",
+      "text": "alphakey other-channel memory",
+      "tags": ["alphakey"],
+      "importance": 1,
+      "tier": 0,
+      "lifecycle": "active",
+      "topic_id": "ops"
+    },
+    {
+      "id": 5,
+      "scope": "channel:100",
+      "guild_id": 1,
+      "channel_id": 100,
+      "channel_name": "chan-100",
+      "author_id": 14,
+      "author_name": "epsilon",
+      "text": "alphakey archived memory",
+      "tags": ["alphakey"],
+      "importance": 1,
+      "tier": 0,
+      "lifecycle": "archived",
+      "topic_id": "ops"
+    },
+    {
+      "id": 7,
+      "scope": "global",
+      "guild_id": null,
+      "channel_id": null,
+      "channel_name": null,
+      "author_id": 20,
+      "author_name": "sigma",
+      "text": "betakey hot memory",
+      "tags": ["betakey"],
+      "importance": 1,
+      "tier": 0,
+      "lifecycle": "active",
+      "topic_id": "global_ops"
+    },
+    {
+      "id": 8,
+      "scope": "global",
+      "guild_id": null,
+      "channel_id": null,
+      "channel_name": null,
+      "author_id": 21,
+      "author_name": "tau",
+      "text": "betakey warm memory",
+      "tags": ["betakey"],
+      "importance": 0,
+      "tier": 1,
+      "lifecycle": "active",
+      "topic_id": "global_ops"
+    },
+    {
+      "id": 9,
+      "scope": "global",
+      "guild_id": null,
+      "channel_id": null,
+      "channel_name": null,
+      "author_id": 22,
+      "author_name": "upsilon",
+      "text": "betakey cold memory",
+      "tags": ["betakey"],
+      "importance": 0,
+      "tier": 2,
+      "lifecycle": "active",
+      "topic_id": "global_ops"
+    }
+  ],
+  "summaries": [
+    {
+      "id": 10,
+      "topic_id": "ops",
+      "summary_type": "topic_gist",
+      "scope": "channel:100",
+      "summary_text": "alphakey summary for channel 100",
+      "tags": ["alphakey"],
+      "importance": 1,
+      "lifecycle": "active"
+    },
+    {
+      "id": 11,
+      "topic_id": "ops",
+      "summary_type": "topic_gist",
+      "scope": "channel:200",
+      "summary_text": "alphakey summary for channel 200",
+      "tags": ["alphakey"],
+      "importance": 1,
+      "lifecycle": "active"
+    },
+    {
+      "id": 12,
+      "topic_id": "ops",
+      "summary_type": "topic_gist",
+      "scope": "global",
+      "summary_text": "alphakey global summary",
+      "tags": ["alphakey"],
+      "importance": 1,
+      "lifecycle": "active"
+    },
+    {
+      "id": 13,
+      "topic_id": "ops",
+      "summary_type": "topic_gist",
+      "scope": "channel:100",
+      "summary_text": "alphakey archived summary",
+      "tags": ["alphakey"],
+      "importance": 1,
+      "lifecycle": "archived"
+    },
+    {
+      "id": 20,
+      "topic_id": "global_ops",
+      "summary_type": "topic_gist",
+      "scope": "global",
+      "summary_text": "betakey global summary",
+      "tags": ["betakey"],
+      "importance": 1,
+      "lifecycle": "active"
+    },
+    {
+      "id": 21,
+      "topic_id": "global_ops",
+      "summary_type": "topic_gist",
+      "scope": "channel:100",
+      "summary_text": "betakey channel summary",
+      "tags": ["betakey"],
+      "importance": 1,
+      "lifecycle": "active"
+    }
+  ],
+  "cases": [
+    {
+      "name": "channel_scope_budgeted_mix",
+      "prompt": "alphakey",
+      "scope": "auto channel:100 guild:1",
+      "memory_budget": {"hot": 1, "warm": 1, "cold": 0, "summaries": 1, "meta": 0},
+      "expected_event_ids": [1, 2],
+      "expected_summary_ids": [10],
+      "unexpected_event_ids": [3, 4, 5],
+      "unexpected_summary_ids": [11, 12, 13],
+      "required_tiers": [0, 1],
+      "forbidden_tiers": [2],
+      "max_events": 2,
+      "max_summaries": 1
+    },
+    {
+      "name": "global_scope_returns_global_partition",
+      "prompt": "betakey",
+      "scope": "auto",
+      "memory_budget": {"hot": 2, "warm": 2, "cold": 1, "summaries": 2, "meta": 0},
+      "expected_event_ids": [7, 8, 9],
+      "expected_summary_ids": [20],
+      "unexpected_summary_ids": [21],
+      "required_tiers": [0, 1, 2],
+      "max_events": 5,
+      "max_summaries": 2
+    },
+    {
+      "name": "summary_budget_zero_blocks_summary_recall",
+      "prompt": "alphakey",
+      "scope": "auto channel:100 guild:1",
+      "memory_budget": {"hot": 1, "warm": 0, "cold": 0, "summaries": 0, "meta": 0},
+      "expected_event_ids": [1],
+      "expected_summary_ids": [],
+      "max_events": 1,
+      "max_summaries": 0
+    }
+  ]
+}
+

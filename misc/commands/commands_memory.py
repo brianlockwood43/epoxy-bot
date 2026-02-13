@@ -15,6 +15,23 @@ def register(
     deps: CommandDeps,
     gates: CommandGates,
 ) -> None:
+    def _compose_scope_tokens(ctx: commands.Context, temporal_scope: str) -> str:
+        temporal = (temporal_scope or "auto").strip().lower()
+        if temporal not in {"hot", "warm", "cold", "auto"}:
+            temporal = "auto"
+        tokens = [temporal]
+        try:
+            if getattr(ctx, "channel", None) is not None and getattr(ctx.channel, "id", None) is not None:
+                tokens.append(f"channel:{int(ctx.channel.id)}")
+        except Exception:
+            pass
+        try:
+            if getattr(ctx, "guild", None) is not None and getattr(ctx.guild, "id", None) is not None:
+                tokens.append(f"guild:{int(ctx.guild.id)}")
+        except Exception:
+            pass
+        return " ".join(tokens)
+
     @bot.command(name="memstage")
     async def memstage(ctx: commands.Context):
         if not gates.in_allowed_channel(ctx):
@@ -116,7 +133,8 @@ def register(
             await ctx.send("Usage: `!recall <query>`")
             return
 
-        scope = deps.infer_scope(q) if deps.stage_at_least("M2") else "auto"
+        temporal_scope = deps.infer_scope(q) if deps.stage_at_least("M2") else "auto"
+        scope = _compose_scope_tokens(ctx, temporal_scope)
         events, summaries = await deps.recall_memory_func(q, scope=scope)
 
         pack = deps.format_memory_for_llm(events, summaries, max_chars=1700)
@@ -134,8 +152,9 @@ def register(
             await ctx.send("Usage: `!topic <topic_id>`")
             return
 
+        scope = _compose_scope_tokens(ctx, "auto")
         async with deps.db_lock:
-            summary = await asyncio.to_thread(deps.get_topic_summary_sync, deps.db_conn, topic_id)
+            summary = await asyncio.to_thread(deps.get_topic_summary_sync, deps.db_conn, topic_id, scope, "topic_gist")
         if not summary:
             await ctx.send(f"No summary found for topic '{topic_id}'.")
             return
@@ -155,8 +174,9 @@ def register(
             await ctx.send("Usage: `!summarize <topic_id> [min_age_days]`")
             return
 
+        scope = _compose_scope_tokens(ctx, "auto")
         await ctx.send(f"Summarizing topic **{topic_id}** (min_age_days={min_age_days})...")
-        out = await deps.summarize_topic_func(topic_id, min_age_days=min_age_days)
+        out = await deps.summarize_topic_func(topic_id, scope=scope, summary_type="topic_gist", min_age_days=min_age_days)
         await deps.send_chunked(ctx.channel, f"```\n{out[:1700]}\n```")
 
     @bot.command(name="profile")
@@ -240,6 +260,7 @@ def register(
     async def cmd_memfind(ctx, *, q: str):
         if ctx.channel.id not in gates.allowed_channel_ids:
             return
-        events, summaries = await deps.recall_memory_func(q, scope="auto")
+        scope = _compose_scope_tokens(ctx, "auto")
+        events, summaries = await deps.recall_memory_func(q, scope=scope)
         txt = deps.format_memory_for_llm(events, summaries, max_chars=1800)
         await ctx.send(f"Recall results for: {q}\n{txt}"[:1900])

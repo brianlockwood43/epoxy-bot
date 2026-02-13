@@ -1,4 +1,4 @@
-# Epoxy Developer Reference
+﻿# Epoxy Developer Reference
 
 This file is the maintained developer reference for:
 
@@ -16,7 +16,9 @@ Use this with:
 - Prefix: `!`
 - Most commands are restricted to `allowed channels` (from `EPOXY_ALLOWED_CHANNEL_IDS` or `config/defaults.py` fallback).
 - Announcement commands also work inside threads whose parent is an allowed channel.
-- “Owner-only” checks use `EPOXY_OWNER_USER_IDS` / `EPOXY_OWNER_USERNAMES`.
+- Mention-driven assistant replies are allowed in DMs (not blocked by channel allowlist checks).
+- Mention-driven responses now resolve policy constraints from canonical `meta_items` and apply member-facing privacy clamps.
+- â€œOwner-onlyâ€ checks use `EPOXY_OWNER_USER_IDS` / `EPOXY_OWNER_USERNAMES`.
 
 ---
 
@@ -66,17 +68,20 @@ Use this with:
 - Access: allowed channels
 - Requires: memory stage `M1+`
 - Purpose: retrieve relevant memory events/summaries
+- Scope behavior: retrieval is constrained to current channel/guild context by default
 
 7. `!topic <topic_id>`
 - Access: allowed channels
 - Requires: memory stage `M3`
 - Purpose: fetch stored topic summary
+- Scope behavior: looks up summary partition for current channel/guild context by default
 
 8. `!summarize <topic_id> [min_age_days]`
 - Access: allowed channels
 - Requires: memory stage `M3`
 - Default: `min_age_days=14`
 - Purpose: force-generate topic summary
+- Scope behavior: writes summary into current context partition (`channel`/`guild`/`global`)
 
 9. `!profile @User | <text>`
 - Access: allowed channels
@@ -90,6 +95,7 @@ Use this with:
 11. `!memfind <query>`
 - Access: allowed channels
 - Purpose: quick recall debug output
+- Scope behavior: retrieval is constrained to current channel/guild context by default
 
 ### Mining Commands
 
@@ -427,6 +433,9 @@ For DM draft episodes, `implicit_signals_json` includes structured artifact keys
 4. Validate test suite:
 - `python -m unittest -v`
 
+5. Run baseline eval gates before promoting retrieval/policy changes:
+- `python -m unittest -v tests.test_eval_memory_recall_baseline tests.test_eval_controller_policy_adherence`
+
 ---
 
 ## Docs Maintenance Checklist
@@ -444,7 +453,7 @@ When shipping any runtime or behavior change, update docs in the same PR.
 - If a var was deprecated, keep a short deprecation note for one release cycle.
 
 3. Schema/migration changes:
-- If adding a migration that changes runtime behavior, add a short note under this file’s operational tips.
+- If adding a migration that changes runtime behavior, add a short note under this fileâ€™s operational tips.
 - If the change is announcement-specific, also update `docs/announcement_automation_runbook.md`.
 
 4. Runtime flow changes:

@@ -13,10 +13,21 @@ def insert_memory_event_sync(
     safe_json_loads: Callable[[str], list[Any]],
 ) -> int:
     cur = conn.cursor()
+    scope = payload.get("scope")
+    if scope is None or not str(scope).strip():
+        channel_id = payload.get("channel_id")
+        guild_id = payload.get("guild_id")
+        if channel_id is not None:
+            scope = f"channel:{int(channel_id)}"
+        elif guild_id is not None:
+            scope = f"guild:{int(guild_id)}"
+        else:
+            scope = "global"
     cur.execute(
         """
         INSERT INTO memory_events (
             created_at_utc, created_ts,
+            scope,
             guild_id, channel_id, channel_name,
             author_id, author_name,
             source_message_id,
@@ -25,11 +36,12 @@ def insert_memory_event_sync(
             summarized,
             logged_from_channel_id, logged_from_channel_name, logged_from_message_id,
             source_channel_id, source_channel_name
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload["created_at_utc"],
             payload["created_ts"],
+            scope,
             payload.get("guild_id"),
             payload.get("channel_id"),
             payload.get("channel_name"),
@@ -122,9 +134,23 @@ def upsert_summary_sync(
     safe_json_loads: Callable[[str], list[Any]],
 ) -> int:
     cur = conn.cursor()
+    topic_id = str(payload.get("topic_id") or "").strip().lower()
+    if not topic_id:
+        raise ValueError("topic_id is required for summary upsert")
+    scope = (payload.get("scope") or "").strip() or "global"
+    summary_type = (payload.get("summary_type") or "").strip() or "topic_gist"
     cur.execute(
-        "SELECT id FROM memory_summaries WHERE topic_id = ? ORDER BY id DESC LIMIT 1",
-        (payload["topic_id"],),
+        """
+        SELECT id
+        FROM memory_summaries
+        WHERE topic_id = ?
+          AND COALESCE(lifecycle, 'active') = 'active'
+          AND COALESCE(scope, 'global') = COALESCE(?, 'global')
+          AND COALESCE(summary_type, 'topic_gist') = COALESCE(?, 'topic_gist')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (topic_id, scope, summary_type),
     )
     row = cur.fetchone()
     if row:
@@ -132,7 +158,7 @@ def upsert_summary_sync(
         cur.execute(
             """
             UPDATE memory_summaries
-            SET updated_at_utc=?, start_ts=?, end_ts=?, tags_json=?, importance=?, summary_text=?
+            SET updated_at_utc=?, start_ts=?, end_ts=?, tags_json=?, importance=?, summary_text=?, scope=?, summary_type=?
             WHERE id=?
             """,
             (
@@ -142,6 +168,8 @@ def upsert_summary_sync(
                 payload.get("tags_json", "[]"),
                 int(payload.get("importance", 1)),
                 payload["summary_text"],
+                scope,
+                summary_type,
                 sid,
             ),
         )
@@ -149,12 +177,14 @@ def upsert_summary_sync(
         cur.execute(
             """
             INSERT INTO memory_summaries (
-                topic_id, created_at_utc, updated_at_utc,
+                topic_id, summary_type, scope, created_at_utc, updated_at_utc,
                 start_ts, end_ts, tags_json, importance, summary_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                payload["topic_id"],
+                topic_id,
+                summary_type,
+                scope,
                 payload["created_at_utc"],
                 payload["updated_at_utc"],
                 payload.get("start_ts"),
@@ -170,7 +200,7 @@ def upsert_summary_sync(
     cur.execute("DELETE FROM memory_summaries_fts WHERE rowid = ?", (sid,))
     cur.execute(
         "INSERT INTO memory_summaries_fts(rowid, topic_id, summary_text, tags) VALUES (?, ?, ?, ?)",
-        (sid, payload["topic_id"], payload["summary_text"], tags_for_fts),
+        (sid, topic_id, payload["summary_text"], tags_for_fts),
     )
 
     conn.commit()
@@ -205,9 +235,12 @@ def search_memory_events_sync(
 
     cur = conn.cursor()
     tier_placeholders = ",".join("?" for _ in allowed_tiers)
+    channel_scope = f"channel:{int(channel_id)}" if channel_id is not None else None
+    guild_scope = f"guild:{int(guild_id)}" if guild_id is not None else None
     cur.execute(
         f"""
         SELECT me.id, me.created_at_utc, me.created_ts,
+               me.scope,
                me.channel_id, me.channel_name,
                me.author_id, me.author_name,
                me.source_message_id,
@@ -221,12 +254,22 @@ def search_memory_events_sync(
         FROM memory_events_fts
         JOIN memory_events me ON me.id = memory_events_fts.rowid
         WHERE memory_events_fts MATCH ?
+        AND COALESCE(me.lifecycle, 'active') = 'active'
         AND me.tier IN ({tier_placeholders})
-        AND (? IS NULL OR me.channel_id = ?)
-        AND (? IS NULL OR me.guild_id = ?)
+        AND (? IS NULL OR me.channel_id = ? OR me.scope = ?)
+        AND (? IS NULL OR me.guild_id = ? OR me.scope = ?)
         LIMIT 60
         """,
-        (fts_q, *allowed_tiers, channel_id, channel_id, guild_id, guild_id),
+        (
+            fts_q,
+            *allowed_tiers,
+            channel_id,
+            channel_id,
+            channel_scope,
+            guild_id,
+            guild_id,
+            guild_scope,
+        ),
     )
     rows = cur.fetchall()
 
@@ -237,6 +280,7 @@ def search_memory_events_sync(
         mid,
         created_at_utc,
         created_ts,
+        row_scope,
         row_channel_id,
         channel_name,
         author_id,
@@ -256,7 +300,7 @@ def search_memory_events_sync(
         source_channel_name,
         rank,
     ) in rows:
-        tier = int(tier or 1)
+        tier = int(tier) if tier is not None else 1
         if tier not in allowed_tiers:
             continue
 
@@ -288,6 +332,7 @@ def search_memory_events_sync(
                     "id": int(mid),
                     "created_at_utc": created_at_utc,
                     "created_ts": int(created_ts or 0),
+                    "scope": row_scope,
                     "channel_id": row_channel_id,
                     "channel_name": channel_name,
                     "author_id": author_id,
@@ -316,33 +361,72 @@ def search_memory_events_sync(
 def search_memory_summaries_sync(
     conn: sqlite3.Connection,
     query: str,
+    scope: str,
     limit: int = 3,
     *,
     build_fts_query: Callable[[str], str],
+    parse_recall_scope: Callable[[str | None], tuple[str, int | None, int | None]],
     safe_json_loads: Callable[[str], list[Any]],
 ) -> list[dict[str, Any]]:
     fts_q = build_fts_query(query)
     if not fts_q:
         return []
+    _, guild_id, channel_id = parse_recall_scope(scope)
+    scope_candidates: list[str] = []
+    if channel_id is not None:
+        scope_candidates.append(f"channel:{int(channel_id)}")
+    if guild_id is not None:
+        scope_candidates.append(f"guild:{int(guild_id)}")
+
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT ms.id, ms.topic_id, ms.updated_at_utc, ms.start_ts, ms.end_ts, ms.tags_json, ms.importance, ms.summary_text,
-               bm25(memory_summaries_fts) as rank
-        FROM memory_summaries_fts
-        JOIN memory_summaries ms ON ms.id = memory_summaries_fts.rowid
-        WHERE memory_summaries_fts MATCH ?
-        LIMIT 20
-        """,
-        (fts_q,),
-    )
+    if scope_candidates:
+        scope_placeholders = ",".join("?" for _ in scope_candidates)
+        cur.execute(
+            f"""
+            SELECT ms.id, ms.topic_id, ms.scope, ms.updated_at_utc, ms.start_ts, ms.end_ts, ms.tags_json, ms.importance, ms.summary_text,
+                   bm25(memory_summaries_fts) as rank
+            FROM memory_summaries_fts
+            JOIN memory_summaries ms ON ms.id = memory_summaries_fts.rowid
+            WHERE memory_summaries_fts MATCH ?
+              AND COALESCE(ms.lifecycle, 'active') = 'active'
+              AND COALESCE(ms.scope, '') IN ({scope_placeholders})
+            LIMIT 20
+            """,
+            (fts_q, *scope_candidates),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT ms.id, ms.topic_id, ms.scope, ms.updated_at_utc, ms.start_ts, ms.end_ts, ms.tags_json, ms.importance, ms.summary_text,
+                   bm25(memory_summaries_fts) as rank
+            FROM memory_summaries_fts
+            JOIN memory_summaries ms ON ms.id = memory_summaries_fts.rowid
+            WHERE memory_summaries_fts MATCH ?
+              AND COALESCE(ms.lifecycle, 'active') = 'active'
+              AND COALESCE(ms.scope, 'global') = 'global'
+            LIMIT 20
+            """,
+            (fts_q,),
+        )
     rows = cur.fetchall()
     out = []
-    for (sid, topic_id, updated_at_utc, start_ts, end_ts, tags_json, importance, summary_text, rank) in rows:
+    for (
+        sid,
+        topic_id,
+        summary_scope,
+        updated_at_utc,
+        start_ts,
+        end_ts,
+        tags_json,
+        importance,
+        summary_text,
+        rank,
+    ) in rows:
         out.append(
             {
                 "id": int(sid),
                 "topic_id": topic_id,
+                "scope": summary_scope,
                 "updated_at_utc": updated_at_utc,
                 "start_ts": int(start_ts or 0),
                 "end_ts": int(end_ts or 0),
@@ -363,8 +447,9 @@ def cleanup_memory_sync(
 ) -> tuple[int, int]:
     cur = conn.cursor()
     now = int(time.time())
-    events_deleted = 0
-    summaries_deleted = 0
+    now_iso_utc = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now))
+    events_transitioned = 0
+    summaries_transitioned = 0
 
     cur.execute(
         """
@@ -379,31 +464,98 @@ def cleanup_memory_sync(
         (now, now, now),
     )
 
+    cur.execute(
+        """
+        UPDATE memory_events
+        SET lifecycle='deprecated',
+            updated_at_utc=?
+        WHERE COALESCE(lifecycle, 'active')='active'
+          AND expiry_at_utc IS NOT NULL
+          AND TRIM(expiry_at_utc) != ''
+          AND expiry_at_utc <= ?
+        """,
+        (now_iso_utc, now_iso_utc),
+    )
+    events_transitioned += int(cur.rowcount or 0)
+
     if stage_at_least("M1") and not stage_at_least("M2"):
-        cur.execute("DELETE FROM memory_events WHERE importance=0 AND created_ts < ?", (now - 14 * 86400,))
-        events_deleted += cur.rowcount
+        cur.execute(
+            """
+            UPDATE memory_events
+            SET lifecycle='archived',
+                updated_at_utc=?
+            WHERE COALESCE(lifecycle, 'active')='active'
+              AND importance=0
+              AND created_ts < ?
+            """,
+            (now_iso_utc, now - 14 * 86400),
+        )
+        events_transitioned += int(cur.rowcount or 0)
     elif stage_at_least("M2"):
-        cur.execute("DELETE FROM memory_events WHERE importance=0 AND created_ts < ?", (now - 90 * 86400,))
-        events_deleted += cur.rowcount
+        cur.execute(
+            """
+            UPDATE memory_events
+            SET lifecycle='archived',
+                updated_at_utc=?
+            WHERE COALESCE(lifecycle, 'active')='active'
+              AND importance=0
+              AND created_ts < ?
+            """,
+            (now_iso_utc, now - 90 * 86400),
+        )
+        events_transitioned += int(cur.rowcount or 0)
+
+    cur.execute(
+        """
+        UPDATE memory_summaries
+        SET tier = CASE
+            WHEN (? - COALESCE(end_ts, start_ts, ?)) < 14*86400 THEN 1
+            WHEN (? - COALESCE(end_ts, start_ts, ?)) < 90*86400 THEN 2
+            ELSE 3
+        END
+        WHERE COALESCE(end_ts, start_ts, 0) > 0
+        """,
+        (now, now, now, now),
+    )
+
+    if stage_at_least("M2"):
+        cur.execute(
+            """
+            UPDATE memory_summaries
+            SET lifecycle='archived',
+                updated_at_utc=?
+            WHERE COALESCE(lifecycle, 'active')='active'
+              AND importance=0
+              AND COALESCE(end_ts, start_ts, 0) > 0
+              AND COALESCE(end_ts, start_ts, 0) < ?
+            """,
+            (now_iso_utc, now - 180 * 86400),
+        )
+        summaries_transitioned += int(cur.rowcount or 0)
 
     cur.execute("DELETE FROM memory_events_fts WHERE rowid NOT IN (SELECT id FROM memory_events)")
     cur.execute("DELETE FROM memory_summaries_fts WHERE rowid NOT IN (SELECT id FROM memory_summaries)")
     conn.commit()
-    return events_deleted, summaries_deleted
+    return events_transitioned, summaries_transitioned
 
 
 def fetch_topic_events_sync(
     conn: sqlite3.Connection,
     topic_id: str,
+    scope: str = "auto",
     min_age_days: int = 14,
     max_events: int = 200,
     *,
+    parse_recall_scope: Callable[[str | None], tuple[str, int | None, int | None]],
     safe_json_loads: Callable[[str], list[Any]],
 ) -> list[dict[str, Any]]:
     topic_id = (topic_id or "").strip().lower()
     if not topic_id:
         return []
     cur = conn.cursor()
+    _, guild_id, channel_id = parse_recall_scope(scope)
+    channel_scope = f"channel:{int(channel_id)}" if channel_id is not None else None
+    guild_scope = f"guild:{int(guild_id)}" if guild_id is not None else None
     cutoff = int(time.time()) - int(min_age_days) * 86400
     like_pat = f'%"{topic_id}"%'
 
@@ -413,6 +565,9 @@ def fetch_topic_events_sync(
         FROM memory_events
         WHERE importance = 1
           AND summarized = 0
+          AND COALESCE(lifecycle, 'active') = 'active'
+          AND (? IS NULL OR channel_id = ? OR scope = ?)
+          AND (? IS NULL OR guild_id = ? OR scope = ?)
           AND created_ts < ?
           AND (
                 (topic_id IS NOT NULL AND topic_id = ?)
@@ -421,7 +576,18 @@ def fetch_topic_events_sync(
         ORDER BY created_ts ASC
         LIMIT ?
         """,
-        (cutoff, topic_id, like_pat, int(max_events)),
+        (
+            channel_id,
+            channel_id,
+            channel_scope,
+            guild_id,
+            guild_id,
+            guild_scope,
+            cutoff,
+            topic_id,
+            like_pat,
+            int(max_events),
+        ),
     )
     rows = cur.fetchall()
     out = []
@@ -443,30 +609,70 @@ def fetch_topic_events_sync(
 def get_topic_summary_sync(
     conn: sqlite3.Connection,
     topic_id: str,
+    scope: str = "auto",
+    summary_type: str = "topic_gist",
     *,
+    parse_recall_scope: Callable[[str | None], tuple[str, int | None, int | None]],
     safe_json_loads: Callable[[str], list[Any]],
 ) -> dict[str, Any] | None:
     topic_id = (topic_id or "").strip().lower()
     if not topic_id:
         return None
+    summary_type = (summary_type or "").strip() or "topic_gist"
+    _, guild_id, channel_id = parse_recall_scope(scope)
+    scope_candidates: list[str] = []
+    if channel_id is not None:
+        scope_candidates.append(f"channel:{int(channel_id)}")
+    if guild_id is not None:
+        scope_candidates.append(f"guild:{int(guild_id)}")
+
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, topic_id, updated_at_utc, start_ts, end_ts, tags_json, importance, summary_text
-        FROM memory_summaries
-        WHERE topic_id = ?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (topic_id,),
-    )
+    if scope_candidates:
+        scope_placeholders = ",".join("?" for _ in scope_candidates)
+        preferred_scope_1 = scope_candidates[0]
+        preferred_scope_2 = scope_candidates[1] if len(scope_candidates) > 1 else scope_candidates[0]
+        cur.execute(
+            f"""
+            SELECT id, topic_id, scope, summary_type, updated_at_utc, start_ts, end_ts, tags_json, importance, summary_text
+            FROM memory_summaries
+            WHERE topic_id = ?
+              AND COALESCE(lifecycle, 'active') = 'active'
+              AND COALESCE(summary_type, 'topic_gist') = COALESCE(?, 'topic_gist')
+              AND COALESCE(scope, '') IN ({scope_placeholders})
+            ORDER BY
+              CASE
+                WHEN COALESCE(scope, '') = ? THEN 0
+                WHEN COALESCE(scope, '') = ? THEN 1
+                ELSE 2
+              END,
+              id DESC
+            LIMIT 1
+            """,
+            (topic_id, summary_type, *scope_candidates, preferred_scope_1, preferred_scope_2),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, topic_id, scope, summary_type, updated_at_utc, start_ts, end_ts, tags_json, importance, summary_text
+            FROM memory_summaries
+            WHERE topic_id = ?
+              AND COALESCE(lifecycle, 'active') = 'active'
+              AND COALESCE(summary_type, 'topic_gist') = COALESCE(?, 'topic_gist')
+              AND COALESCE(scope, 'global') = 'global'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (topic_id, summary_type),
+        )
     row = cur.fetchone()
     if not row:
         return None
-    sid, found_topic_id, updated_at_utc, start_ts, end_ts, tags_json, importance, summary_text = row
+    sid, found_topic_id, summary_scope, found_summary_type, updated_at_utc, start_ts, end_ts, tags_json, importance, summary_text = row
     return {
         "id": int(sid),
         "topic_id": found_topic_id,
+        "scope": summary_scope,
+        "summary_type": found_summary_type,
         "updated_at_utc": updated_at_utc,
         "start_ts": int(start_ts or 0),
         "end_ts": int(end_ts or 0),
