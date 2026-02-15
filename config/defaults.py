@@ -16,6 +16,7 @@ DEFAULT_ANNOUNCE_PREP_CHANNEL_ID = 1412603858835738784
 
 # Stage / memory defaults
 STAGE_RANK = {"M0": 0, "M1": 1, "M2": 2, "M3": 3}
+DEFAULT_MEMORY_REVIEW_MODE = "capture_only"
 RESERVED_KIND_TAGS = {"decision", "policy", "canon", "profile", "protocol"}
 DEFAULT_TOPIC_ALLOWLIST = (
     "ops,announcements,community,coaches,workshops,league,one_on_one,"

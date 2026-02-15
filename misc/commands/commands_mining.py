@@ -166,6 +166,7 @@ Rules:
                 importance=importance,
                 message=ctx.message,
                 topic_hint=topic_id,
+                source_path="mining",
             )
             if not res:
                 continue

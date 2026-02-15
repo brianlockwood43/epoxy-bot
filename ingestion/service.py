@@ -55,14 +55,28 @@ async def maybe_auto_capture(
         tags = [kind]
         if topic:
             tags = [topic] + tags
-        await remember_event_func(text=text, tags=tags, importance=1, message=message, topic_hint=topic if topic else None)
+        await remember_event_func(
+            text=text,
+            tags=tags,
+            importance=1,
+            message=message,
+            topic_hint=topic if topic else None,
+            source_path="auto_capture",
+        )
         return
 
     m2 = re.match(r"^#mem\s+([a-zA-Z0-9_\-]{3,})\s*:\s*(.+)$", content)
     if m2:
         topic = m2.group(1).strip().lower()
         text = (m2.group(2) or "").strip()
-        await remember_event_func(text=text, tags=[topic], importance=1, message=message, topic_hint=topic)
+        await remember_event_func(
+            text=text,
+            tags=[topic],
+            importance=1,
+            message=message,
+            topic_hint=topic,
+            source_path="auto_capture",
+        )
         return
 
 

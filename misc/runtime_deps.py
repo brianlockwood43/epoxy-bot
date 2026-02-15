@@ -15,6 +15,7 @@ class RuntimeDeps:
     # stages / time
     stage_at_least: Callable[[str], bool]
     memory_stage: str
+    memory_review_mode: str
     utc_iso: Callable[[], str]
 
     # logging / ingestion

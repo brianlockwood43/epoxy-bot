@@ -124,6 +124,30 @@ async def suggest_topic_id(
     return (topic, conf_f)
 
 
+def resolve_memory_lifecycle(
+    *,
+    memory_review_mode: str,
+    source_path: str,
+    owner_override_active: bool,
+) -> str:
+    mode = (memory_review_mode or "capture_only").strip().lower()
+    source = (source_path or "").strip().lower()
+
+    if mode not in {"off", "capture_only", "all"}:
+        mode = "capture_only"
+
+    if mode == "off":
+        return "active"
+
+    if mode == "capture_only":
+        return "active" if source == "manual_remember" else "candidate"
+
+    # mode == "all"
+    if source == "manual_remember" and owner_override_active:
+        return "active"
+    return "candidate"
+
+
 async def remember_event(
     *,
     text: str,
@@ -131,6 +155,9 @@ async def remember_event(
     importance: int,
     message: Any | None = None,
     topic_hint: str | None = None,
+    memory_review_mode: str = "capture_only",
+    source_path: str = "manual_remember",
+    owner_override_active: bool = False,
     stage_at_least,
     normalize_tags,
     reserved_kind_tags: set[str],
@@ -217,6 +244,11 @@ async def remember_event(
 
     created_ts = utc_ts(created_dt) if created_dt else utc_ts()
     tier = infer_tier(created_ts) if stage_at_least("M2") else 1
+    lifecycle = resolve_memory_lifecycle(
+        memory_review_mode=memory_review_mode,
+        source_path=source_path,
+        owner_override_active=owner_override_active,
+    )
 
     payload = {
         "created_at_utc": utc_iso(created_dt) if created_dt else utc_iso(),
@@ -245,6 +277,7 @@ async def remember_event(
         "topic_source": topic_source,
         "topic_confidence": topic_confidence,
         "summarized": 0,
+        "lifecycle": lifecycle,
     }
 
     if not payload["text"]:
@@ -255,6 +288,7 @@ async def remember_event(
 
     return {
         "id": int(mem_id),
+        "lifecycle": lifecycle,
         "topic_id": topic_id,
         "topic_source": topic_source,
         "topic_confidence": topic_confidence,

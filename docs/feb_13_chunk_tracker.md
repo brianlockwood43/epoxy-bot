@@ -22,7 +22,7 @@ Status values:
 
 | Chunk | Title | Owner | Status | Start Date | End Date | PR/Branch | Notes |
 |---|---|---|---|---|---|---|---|
-| 8 | Memory Review Mode + Candidate Lifecycle | TBD | planned |  |  |  |  |
+| 8 | Memory Review Mode + Candidate Lifecycle | Codex | in_review | 2026-02-15 |  |  | Deferred follow-up: !profile -> meta-memory store after meta-layer expansion; not part of Chunk 8. |
 | 9 | Review Workflow Commands + Audit Log | TBD | planned |  |  |  |  |
 | 10 | Typed Tag Contract + Provenance Field | TBD | planned |  |  |  |  |
 | 11 | Meta Model Expansion + Backbone Registry | TBD | planned |  |  |  |  |
@@ -146,6 +146,7 @@ Release Decision
 
 | Date | Chunk | Severity | Blocker / Risk | Owner | Mitigation / Next Step | Status |
 |---|---|---|---|---|---|---|
+| 2026-02-15 | 8 | low | !profile currently writes atomic memory_events; intended long-term target is meta-memory. | Brian + Codex | Track migration design after Chunk 11 schema expansion. | open |
 |  |  |  |  |  |  | open |
 
 ## 6) Final Rollout Checklist
@@ -155,4 +156,3 @@ Release Decision
 - [ ] Staging run with `EPOXY_META_LAYERED_RETRIEVAL=1` completed.
 - [ ] Eval gates pass for layered meta retrieval + existing baselines.
 - [ ] Production default decision recorded (date + owner).
-

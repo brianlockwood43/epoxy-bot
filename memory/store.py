@@ -31,12 +31,13 @@ def insert_memory_event_sync(
             guild_id, channel_id, channel_name,
             author_id, author_name,
             source_message_id,
+            lifecycle,
             text, tags_json, importance, tier,
             topic_id, topic_source, topic_confidence,
             summarized,
             logged_from_channel_id, logged_from_channel_name, logged_from_message_id,
             source_channel_id, source_channel_name
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload["created_at_utc"],
@@ -48,6 +49,7 @@ def insert_memory_event_sync(
             payload.get("author_id"),
             payload.get("author_name"),
             payload.get("source_message_id"),
+            payload.get("lifecycle", "active"),
             payload["text"],
             payload.get("tags_json", "[]"),
             int(payload.get("importance", 0)),

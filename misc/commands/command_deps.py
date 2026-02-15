@@ -26,6 +26,7 @@ class CommandDeps:
     memory_stage_rank: int = 0
     auto_capture: bool = False
     auto_summary: bool = False
+    memory_review_mode: str = "capture_only"
     topic_suggest: bool = False
     topic_min_conf: float = 0.85
     topic_allowlist: list[str] = field(default_factory=list)

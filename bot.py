@@ -14,6 +14,7 @@ from config.defaults import DEFAULT_ALLOWED_CHANNEL_IDS
 from config.defaults import DEFAULT_BACKFILL_LIMIT
 from config.defaults import DEFAULT_BACKFILL_PAUSE_EVERY
 from config.defaults import DEFAULT_BACKFILL_PAUSE_SECONDS
+from config.defaults import DEFAULT_MEMORY_REVIEW_MODE
 from config.defaults import DEFAULT_RECENT_CONTEXT_LIMIT
 from config.defaults import DEFAULT_RECENT_CONTEXT_LINE_CHARS
 from config.defaults import DEFAULT_RECENT_CONTEXT_MAX_CHARS
@@ -123,6 +124,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.1")
 #   EPOXY_MEMORY_STAGE = M0 | M1 | M2 | M3   (default: M0)
 #   EPOXY_MEMORY_ENABLE_AUTO_CAPTURE = 0/1   (default: 0)
 #   EPOXY_MEMORY_ENABLE_AUTO_SUMMARY = 0/1   (default: 0)
+#   EPOXY_MEMORY_REVIEW_MODE = off|capture_only|all (default: capture_only)
 #
 # Notes:
 # - “Wire to M3” means: the DB schema + codepaths exist up through M3,
@@ -141,6 +143,13 @@ def stage_at_least(stage: str) -> bool:
 # Feature toggles (default OFF; flip via env when testing)
 AUTO_CAPTURE = os.getenv("EPOXY_MEMORY_ENABLE_AUTO_CAPTURE", "0").strip() == "1"
 AUTO_SUMMARY = os.getenv("EPOXY_MEMORY_ENABLE_AUTO_SUMMARY", "0").strip() == "1"
+MEMORY_REVIEW_MODE = os.getenv("EPOXY_MEMORY_REVIEW_MODE", DEFAULT_MEMORY_REVIEW_MODE).strip().lower()
+if MEMORY_REVIEW_MODE not in {"off", "capture_only", "all"}:
+    print(
+        f"[CFG] invalid EPOXY_MEMORY_REVIEW_MODE={MEMORY_REVIEW_MODE!r}; "
+        f"falling back to {DEFAULT_MEMORY_REVIEW_MODE!r}"
+    )
+    MEMORY_REVIEW_MODE = DEFAULT_MEMORY_REVIEW_MODE
 BOOTSTRAP_BACKFILL_CAPTURE = os.getenv("EPOXY_BOOTSTRAP_BACKFILL_CAPTURE", "0").strip() == "1"
 BOOTSTRAP_CHANNEL_RESET = os.getenv("EPOXY_BOOTSTRAP_CHANNEL_RESET", "0").strip() == "1"
 
@@ -173,6 +182,7 @@ else:
 
 print(
     f"[CFG] stage={MEMORY_STAGE} auto_capture={AUTO_CAPTURE} auto_summary={AUTO_SUMMARY} "
+    f"review_mode={MEMORY_REVIEW_MODE} "
     f"topic_suggest={TOPIC_SUGGEST} topic_min_conf={TOPIC_MIN_CONF} "
     f"allowlist={'(db-topics)' if not TOPIC_ALLOWLIST else str(len(TOPIC_ALLOWLIST))+' topics'}"
 )
@@ -979,6 +989,8 @@ async def remember_event(
     importance: int,
     message: discord.Message | None = None,
     topic_hint: str | None = None,
+    source_path: str = "manual_remember",
+    owner_override_active: bool = False,
 ) -> dict | None:
     return await remember_event_service(
         text=text,
@@ -986,6 +998,9 @@ async def remember_event(
         importance=importance,
         message=message,
         topic_hint=topic_hint,
+        memory_review_mode=MEMORY_REVIEW_MODE,
+        source_path=source_path,
+        owner_override_active=owner_override_active,
         stage_at_least=stage_at_least,
         normalize_tags=normalize_tags,
         reserved_kind_tags=RESERVED_KIND_TAGS,
@@ -1155,6 +1170,7 @@ wire_bot_runtime(
     stage_at_least=stage_at_least,
     memory_stage=MEMORY_STAGE,
     memory_stage_rank=MEMORY_STAGE_RANK,
+    memory_review_mode=MEMORY_REVIEW_MODE,
     auto_capture=AUTO_CAPTURE,
     auto_summary=AUTO_SUMMARY,
     topic_suggest=TOPIC_SUGGEST,

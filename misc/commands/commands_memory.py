@@ -38,7 +38,8 @@ def register(
             return
         await ctx.send(
             f"Memory stage: **{deps.memory_stage}** (rank={deps.memory_stage_rank}) | "
-            f"AUTO_CAPTURE={'1' if deps.auto_capture else '0'} | AUTO_SUMMARY={'1' if deps.auto_summary else '0'}"
+            f"AUTO_CAPTURE={'1' if deps.auto_capture else '0'} | AUTO_SUMMARY={'1' if deps.auto_summary else '0'} | "
+            f"REVIEW_MODE={deps.memory_review_mode}"
         )
 
     @bot.command(name="topics")
@@ -89,17 +90,21 @@ def register(
             return
 
         importance = 1
+        force_active = 0
         tags: list[str] = []
         text = raw
 
-        if "tags=" in raw or "importance=" in raw or "text=" in raw:
+        if "tags=" in raw or "importance=" in raw or "text=" in raw or "force_active=" in raw:
             m_tags = re.search(r"tags=([^\s]+)", raw)
             m_imp = re.search(r"importance=([01])", raw)
+            m_force = re.search(r"force_active=([01])", raw)
             m_text = re.search(r"text=(.+)$", raw)
             if m_tags:
                 tags = re.split(r"[;,]+", m_tags.group(1))
             if m_imp:
                 importance = int(m_imp.group(1))
+            if m_force:
+                force_active = int(m_force.group(1))
             if m_text:
                 text = m_text.group(1).strip()
         elif "|" in raw:
@@ -107,18 +112,30 @@ def register(
             tags = re.split(r"[,\s]+", left.strip())
             text = right.strip()
 
+        if force_active == 1 and not gates.user_is_owner(ctx.author):
+            await ctx.send("`force_active=1` is owner-only.")
+            return
+
         tags = deps.normalize_tags(tags)
-        saved = await deps.remember_event_func(text=text, tags=tags, importance=importance, message=ctx.message)
+        saved = await deps.remember_event_func(
+            text=text,
+            tags=tags,
+            importance=importance,
+            message=ctx.message,
+            source_path="manual_remember",
+            owner_override_active=(force_active == 1),
+        )
         if not saved:
             await ctx.send("Nothing saved (empty text).")
             return
         mem_id = saved.get("id")
+        lifecycle = str(saved.get("lifecycle") or "active")
         topic_id = saved.get("topic_id")
         topic_source = saved.get("topic_source")
         conf = saved.get("topic_confidence")
         conf_txt = f" conf={conf:.2f}" if isinstance(conf, float) else ""
         topic_txt = f" topic={topic_id} ({topic_source}{conf_txt})" if topic_id else " topic=(none)"
-        await ctx.send(f"Saved memory #{mem_id} tags={tags} importance={importance}{topic_txt} 🧴")
+        await ctx.send(f"Saved memory #{mem_id} lifecycle={lifecycle} tags={tags} importance={importance}{topic_txt}")
 
     @bot.command(name="recall")
     async def recall_cmd(ctx: commands.Context, *, query: str = ""):
@@ -224,6 +241,7 @@ def register(
             importance=1,
             message=ctx.message,
             topic_hint=None,
+            source_path="manual_profile",
         )
 
         if not res:
