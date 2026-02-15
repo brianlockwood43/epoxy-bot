@@ -15,19 +15,132 @@ timezone: UTC
 prep_time_local: "22:00"
 prep_channel_id: 1412603858835738784 # thread host for prep pings
 prep_role_name: "" # optional role name to mention on prep ping
+timestamp_placeholders:
+  # Placeholder syntax in generated/copied announcement text:
+  # {{DISCORD_TS:event_name}}
+  default_style: "f"
+  unresolved_policy: "passthrough" # passthrough | block
+  raw_tag_policy: "allow" # allow | block
+  events:
+    monday_workshop_early:
+      weekday: 0
+      hour: 13
+      minute: 30
+      timezone: "America/New_York"
+      style: "f"
+    monday_workshop_evening:
+      weekday: 0
+      hour: 20
+      minute: 0
+      timezone: "America/New_York"
+      style: "f"
+    tuesday_study_hall_early:
+      weekday: 1
+      hour: 13
+      minute: 30
+      timezone: "America/New_York"
+      style: "f"
+    tuesday_study_hall_evening:
+      weekday: 1
+      hour: 20
+      minute: 0
+      timezone: "America/New_York"
+      style: "f"
+    wednesday_adaptability_early:
+      weekday: 2
+      hour: 13
+      minute: 30
+      timezone: "America/New_York"
+      style: "f"
+    wednesday_adaptability_evening:
+      weekday: 2
+      hour: 20
+      minute: 0
+      timezone: "America/New_York"
+      style: "f"
+    thursday_mastery_training:
+      weekday: 3
+      hour: 13
+      minute: 30
+      timezone: "America/New_York"
+      style: "f"
+    friday_funday_start:
+      weekday: 4
+      hour: 20
+      minute: 30
+      timezone: "America/New_York"
+      style: "t"
+    saturday_racecraft_training:
+      weekday: 5
+      hour: 13
+      minute: 30
+      timezone: "America/New_York"
+      style: "f"
+    sunday_race_together:
+      weekday: 6
+      hour: 13
+      minute: 30
+      timezone: "America/New_York"
+      style: "f"
 days:
   monday:
     # Core workshop / training block
-    enabled: false # set true when configured
+    enabled: true 
     target_channel_id: 1410479714182631474 # replace with announcement destination channel id
     publish_time_local: "06:00"
     tone: "Clear, concise, and operational."
     structure:
-      - "Headline"
-      - "Key Updates"
-      - "Actions / Next Steps"
+      - "Hook"
+      - "What we're doing"
+      - "Who it's for"
+      - "When & where"
+      - "What to prep"
     style_guidance:
-      notes: "This announcement is for the public channel, consider including additional context for non-members"
+      notes: |
+        Draft ONE Monday Core Workshop Discord announcement for Lumeris.
+        Use this exact section flow:
+          1) Hook (2-3 sentences)
+          2) What we're doing
+          3) Who it's for
+          4) When & where
+          5) What to prep
+
+        Section requirements:
+        - Hook:
+          - Name the pillar.
+          - Use focus_rationale to make this week feel purposeful and specific.
+        - What we're doing:
+          - State car + track.
+          - List focuses as 1-3 bullets.
+          - Add one short line connecting car/track to the focuses (no overexplaining).
+        - Who it's for:
+          - Include this standard reassurance snippet under this section (exact text is preferred):
+            "The session is designed to work for all levels - we'll have clear exercises at each of the four mastery stages for this pillar, so you'll have a way in whether you're just getting oriented or already pushing for fine detail."
+          - Add one line: "Especially helpful if you're working on: ..." inferred from focuses.
+        - When & where:
+          - Make times, duration, and channel obvious and scannable.
+        - What to prep:
+          - Use prep as a concise checklist.
+
+        Timestamp rules for Monday:
+        - Include both Monday workshop timestamps in every Monday announcement using these exact placeholders:
+          - {{DISCORD_TS:monday_workshop_early}}
+          - {{DISCORD_TS:monday_workshop_evening}}
+
+        Tone and style:
+        - Concrete, grounded, friendly.
+        - No hype.
+        - Max 1-2 emojis total (optional).
+
+        Weekly training pillar reference (carry this context when writing Monday announcements):
+        1) Sensory Load:
+           Training how much sensory input a driver can process without overwhelm, and how to keep perception clear under pressure.
+        2) Decision Making (often referred to as Baseline for shorthand):
+           Training decision points regarding racing line, throttle points, etc., plus efficiently using a baseline of safe, repeatable decisions that avoid unnecessary sensory load and over-limit behavior.
+        3) Limit (Tire Sound Focus):
+           Training how to operate near the tire grip limit using primarily auditory feedback, especially tire sound.
+        4) Balance (Visual + Feel Limit):
+           Training front/rear balance and limit behavior using visual and force-feedback channels rather than tire sound.
       examples: []
     # Optional style guidance example for LLM drafting (used as references only; never copied directly):
     # style_guidance:
@@ -37,14 +150,26 @@ days:
     #       summary: "compact update format"
     #       text: "Quick ops update: [headline]. Key updates: [points]. Actions: [asks]."
     questions:
-      - id: "headline"
-        prompt: "What is the one-line headline for tomorrow?"
+      - id: "pillar"
+        prompt: "Which pillar is this Monday session focused on? (Sensory Load, Decision Making/Baseline, Limit, or Balance)"
         required: true
-      - id: "updates"
-        prompt: "What are the key updates to include?"
+      - id: "car"
+        prompt: "Which car are we using?"
         required: true
-      - id: "actions"
-        prompt: "What actions or asks should members take?"
+      - id: "track"
+        prompt: "Which track are we using?"
+        required: true
+      - id: "focuses"
+        prompt: "List 1-3 specific focuses for this workshop."
+        required: true
+      - id: "focus_rationale"
+        prompt: "In one sentence, why are these the right focuses this week?"
+        required: true
+      - id: "prep"
+        prompt: "Provide a concise prep checklist (bullet style)."
+        required: true
+      - id: "all_levels_reassurance"
+        prompt: "Optional override for the standard all-levels reassurance snippet (leave blank to use the default snippet from style guidance)."
         required: false
   tuesday:
     # Study hall / Q&A - follow-up to Monday
@@ -57,7 +182,10 @@ days:
       - "Progress"
       - "What We Need"
     style_guidance:
-      notes: ""
+      notes: |
+        Include both Tuesday Study Hall/Q&A timestamps in every Tuesday announcement using these exact placeholders:
+          - {{DISCORD_TS:tuesday_study_hall_early}}
+          - {{DISCORD_TS:tuesday_study_hall_evening}}
       examples: []
     questions:
       - id: "opening"
@@ -80,7 +208,10 @@ days:
       - "Main Points"
       - "Timing / Logistics"
     style_guidance:
-      notes: ""
+      notes: |
+        Include both Wednesday adaptability training timestamps in every Wednesday announcement using these exact placeholders:
+          - {{DISCORD_TS:wednesday_adaptability_early}}
+          - {{DISCORD_TS:wednesday_adaptability_evening}}
       examples: []
     questions:
       - id: "context"
@@ -103,7 +234,10 @@ days:
       - "Details"
       - "CTA"
     style_guidance:
-      notes: ""
+      notes: |
+        Include the Thursday Mastery group training timestamp using this exact placeholder:
+          - {{DISCORD_TS:thursday_mastery_training}}
+        Also note that this timeslot can move, and an additional Thursday timeslot may be added later if demand increases.
       examples: []
     questions:
       - id: "topline"
@@ -135,7 +269,7 @@ days:
           - and exactly how/when to join.
         Include at least one vivid "imagine this..." or similar mini-scenario line.
         Close with:
-          - exact start time (Discord timestamp),
+          - exact start time (using a Discord timestamp placeholder),
           - where to join for comms,
           - and where to ask questions if someone is unsure.
       examples:
@@ -175,7 +309,7 @@ days:
 
             =======================
 
-            Friday Funday will start at <t:1770316200:t>. Session names and passwords will be posted shortly before the event starts. Make sure to join us in https://discord.com/channels/1408224292604215340/1411275538978308246 for comms and minigame instructions!
+            Friday Funday will start at {{DISCORD_TS:friday_funday_start}}. Session names and passwords will be posted shortly before the event starts. Make sure to join us in https://discord.com/channels/1408224292604215340/1411275538978308246 for comms and minigame instructions!
 
             Any questions? Just shoot a DM to @blockwood43 or ask in https://discord.com/channels/1408224292604215340/1408224293120380980 and we'll help you out.
 
@@ -204,8 +338,46 @@ days:
       - "Schedule"
       - "Optional Engagement"
     style_guidance:
-      notes: ""
-      examples: []
+      notes: |
+        Include the Saturday Racecraft training timestamp using this exact placeholder:
+          - {{DISCORD_TS:saturday_racecraft_training}}
+      examples:
+      - id: "saturday_ref_1"
+        summary: "Concise description of racecraft training with option for switching to race together if turnout is light"
+        text: |
+          **Saturday Racecraft – Today’s Plan**
+
+          Today’s focus is **racecraft training** with two optional blocks:
+
+          - 🕜 **1:30 PM ET** – structured racecraft session  
+          - 🕗 **8:00 PM ET** – repeat block / extra reps
+
+          We’ll work on:
+          - Clean race starts and first-lap survival
+          - Safe but assertive overtakes
+          - Defending without panic or divebombs
+
+          **How to join:**  
+          Show up in voice a few minutes early, have the combo loaded, and be ready to run short stints with feedback between runs.
+
+          If turnout is light for a given block, we’ll just switch to a more relaxed “race together” format with the same goals in mind.
+          **Saturday Racecraft – Today’s Plan**
+
+          Today’s focus is **racecraft training** with two optional blocks:
+
+          - 🕜 **1:30 PM ET** – structured racecraft session  
+          - 🕗 **8:00 PM ET** – repeat block / extra reps
+
+          We’ll work on:
+          - Clean race starts and first-lap survival
+          - Safe but assertive overtakes
+          - Defending without panic or divebombs
+
+          **How to join:**  
+          Show up in voice a few minutes early, get warmed up, and be ready to join a league session to run short stints and drills with feedback between runs.
+
+          If turnout is light for a given block, we’ll just switch to a more relaxed “race together” format with the same goals in mind.
+          
     questions:
       - id: "update"
         prompt: "What update should we share?"
@@ -227,7 +399,9 @@ days:
       - "Plan Ahead"
       - "Reminders"
     style_guidance:
-      notes: ""
+      notes: |
+        Include the Sunday Race Together timestamp using this exact placeholder:
+          - {{DISCORD_TS:sunday_race_together}}
       examples: []
     questions:
       - id: "reflection"

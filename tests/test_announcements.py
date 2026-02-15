@@ -86,7 +86,13 @@ def _migrations_dir() -> str:
     return str(_repo_root() / "migrations")
 
 
-def _build_templates(path: Path, *, prep_channel_id: int, enabled_days: dict[str, dict]):
+def _build_templates(
+    path: Path,
+    *,
+    prep_channel_id: int,
+    enabled_days: dict[str, dict],
+    timestamp_placeholders: dict | None = None,
+):
     days = {}
     for key in WEEKDAY_KEYS:
         cfg = {
@@ -110,6 +116,8 @@ def _build_templates(path: Path, *, prep_channel_id: int, enabled_days: dict[str
         "prep_role_name": "",
         "days": days,
     }
+    if timestamp_placeholders is not None:
+        payload["timestamp_placeholders"] = dict(timestamp_placeholders)
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
@@ -187,8 +195,19 @@ class AnnouncementServiceTests(unittest.IsolatedAsyncioTestCase):
         self.conn.close()
         self.tmp.cleanup()
 
-    def _service(self, *, client_text: str = "Draft body", enabled_days: dict[str, dict]):
-        _build_templates(self.templates_path, prep_channel_id=100, enabled_days=enabled_days)
+    def _service(
+        self,
+        *,
+        client_text: str = "Draft body",
+        enabled_days: dict[str, dict],
+        timestamp_placeholders: dict | None = None,
+    ):
+        _build_templates(
+            self.templates_path,
+            prep_channel_id=100,
+            enabled_days=enabled_days,
+            timestamp_placeholders=timestamp_placeholders,
+        )
         return AnnouncementService(
             db_lock=self.db_lock,
             db_conn=self.conn,
@@ -206,6 +225,77 @@ class AnnouncementServiceTests(unittest.IsolatedAsyncioTestCase):
             prep_role_name="",
             dry_run=False,
         )
+
+    async def test_generate_returns_rendered_preview_and_stores_raw_placeholder_draft(self):
+        svc = self._service(
+            client_text="Starts {{DISCORD_TS:monday_workshop}}",
+            enabled_days={_tomorrow_key(): {"enabled": True, "target_channel_id": 200, "publish_time_local": "23:59"}},
+            timestamp_placeholders={
+                "default_style": "f",
+                "unresolved_policy": "passthrough",
+                "raw_tag_policy": "allow",
+                "events": {
+                    "monday_workshop": {
+                        "weekday": 0,
+                        "hour": 13,
+                        "minute": 30,
+                        "timezone": "America/New_York",
+                        "style": "f",
+                    }
+                },
+            },
+        )
+        target_date = await svc.resolve_target_date(date_token=None, default_mode="tomorrow", channel_id=None)
+        ok, _, preview = await svc.generate_draft(target_date_local=target_date, actor_user_id=1)
+        self.assertTrue(ok)
+        self.assertIsNotNone(preview)
+        self.assertIn("<t:", preview or "")
+        self.assertNotIn("{{DISCORD_TS:monday_workshop}}", preview or "")
+
+        cycle = await svc.fetch_cycle_by_date(target_date)
+        self.assertIsNotNone(cycle)
+        self.assertIn("{{DISCORD_TS:monday_workshop}}", str(cycle.get("draft_text") or ""))
+
+    async def test_publish_renders_placeholders_before_send_and_persists_rendered_final_text(self):
+        svc = self._service(
+            enabled_days={_today_key(): {"enabled": True, "target_channel_id": 200, "publish_time_local": "23:59"}},
+            timestamp_placeholders={
+                "default_style": "f",
+                "unresolved_policy": "passthrough",
+                "raw_tag_policy": "allow",
+                "events": {
+                    "monday_workshop": {
+                        "weekday": 0,
+                        "hour": 13,
+                        "minute": 30,
+                        "timezone": "America/New_York",
+                        "style": "f",
+                    }
+                },
+            },
+        )
+        today = await svc.resolve_target_date(date_token=None, default_mode="today", channel_id=None)
+        ok, _ = await svc.set_override(
+            target_date_local=today,
+            override_text="See you at {{DISCORD_TS:monday_workshop}}",
+            actor_user_id=1,
+        )
+        self.assertTrue(ok)
+        ok, _ = await svc.approve(target_date_local=today, actor_user_id=1)
+        self.assertTrue(ok)
+
+        ok, msg = await svc.post_now(bot=self.bot, target_date_local=today, actor_user_id=1)
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(self.target_channel.sent), 1)
+        sent = self.target_channel.sent[0]
+        self.assertIn("<t:", sent)
+        self.assertNotIn("{{DISCORD_TS:monday_workshop}}", sent)
+
+        cycle = await svc.fetch_cycle_by_date(today)
+        self.assertIsNotNone(cycle)
+        final_text = str(cycle.get("final_text") or "")
+        self.assertIn("<t:", final_text)
+        self.assertNotIn("{{DISCORD_TS:monday_workshop}}", final_text)
 
     async def test_prep_ping_fires_once(self):
         svc = self._service(

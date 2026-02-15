@@ -11,6 +11,10 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from misc.discord_timestamps import DISCORD_TIMESTAMP_STYLES
+from misc.discord_timestamps import RecurringTimestampSpec
+from misc.discord_timestamps import TimestampRenderResult
+from misc.discord_timestamps import render_named_timestamp_placeholders
 from misc.adhoc_modules.announcements_store import ANNOUNCEMENT_TERMINAL_STATES
 from misc.adhoc_modules.announcements_store import approve_cycle_sync
 from misc.adhoc_modules.announcements_store import create_or_get_cycle_sync
@@ -47,6 +51,7 @@ DONE_MODE_TO_PATH = {
 }
 
 WEEKDAY_KEYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+TIMESTAMP_EVENT_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*")
 
 
 @dataclass(slots=True)
@@ -242,11 +247,68 @@ class AnnouncementService:
                 else None,
             }
 
+        ts_raw = raw.get("timestamp_placeholders") if isinstance(raw.get("timestamp_placeholders"), dict) else {}
+        default_style = str(ts_raw.get("default_style") or "f").strip() or "f"
+        if default_style not in DISCORD_TIMESTAMP_STYLES:
+            default_style = "f"
+
+        unresolved_policy = str(ts_raw.get("unresolved_policy") or "passthrough").strip().lower() or "passthrough"
+        if unresolved_policy not in {"passthrough", "block"}:
+            unresolved_policy = "passthrough"
+
+        raw_tag_policy = str(ts_raw.get("raw_tag_policy") or "allow").strip().lower() or "allow"
+        if raw_tag_policy not in {"allow", "block"}:
+            raw_tag_policy = "allow"
+
+        ts_events_raw = ts_raw.get("events") if isinstance(ts_raw.get("events"), dict) else {}
+        ts_events_out: dict[str, dict[str, Any]] = {}
+        for raw_name, raw_spec in ts_events_raw.items():
+            name = str(raw_name or "").strip()
+            if not TIMESTAMP_EVENT_NAME_RE.fullmatch(name):
+                continue
+            if not isinstance(raw_spec, dict):
+                continue
+            try:
+                weekday = int(raw_spec.get("weekday"))
+                hour = int(raw_spec.get("hour"))
+                minute = int(raw_spec.get("minute"))
+            except Exception:
+                continue
+            timezone_name = str(raw_spec.get("timezone") or "").strip()
+            if not timezone_name:
+                continue
+            try:
+                _ = ZoneInfo(timezone_name)
+            except Exception:
+                continue
+            style = str(raw_spec.get("style") or default_style).strip() or default_style
+            if style not in DISCORD_TIMESTAMP_STYLES:
+                continue
+            if weekday < 0 or weekday > 6:
+                continue
+            if hour < 0 or hour > 23:
+                continue
+            if minute < 0 or minute > 59:
+                continue
+            ts_events_out[name] = {
+                "weekday": weekday,
+                "hour": hour,
+                "minute": minute,
+                "timezone": timezone_name,
+                "style": style,
+            }
+
         merged = {
             "timezone": str(raw.get("timezone") or "UTC").strip() or "UTC",
             "prep_time_local": str(raw.get("prep_time_local") or "09:00").strip() or "09:00",
             "prep_channel_id": int(raw.get("prep_channel_id") or 0),
             "prep_role_name": str(raw.get("prep_role_name") or "").strip(),
+            "timestamp_placeholders": {
+                "default_style": default_style,
+                "unresolved_policy": unresolved_policy,
+                "raw_tag_policy": raw_tag_policy,
+                "events": ts_events_out,
+            },
             "days": days_out,
         }
         return merged
@@ -296,6 +358,75 @@ class AnnouncementService:
         if self.prep_role_name:
             return self.prep_role_name
         return str(self._templates().get("prep_role_name") or "").strip()
+
+    def _timestamp_placeholder_config(self) -> dict[str, Any]:
+        raw_cfg = self._templates().get("timestamp_placeholders")
+        if not isinstance(raw_cfg, dict):
+            raw_cfg = {}
+        default_style = str(raw_cfg.get("default_style") or "f").strip() or "f"
+        if default_style not in DISCORD_TIMESTAMP_STYLES:
+            default_style = "f"
+        unresolved_policy = str(raw_cfg.get("unresolved_policy") or "passthrough").strip().lower() or "passthrough"
+        if unresolved_policy not in {"passthrough", "block"}:
+            unresolved_policy = "passthrough"
+        raw_tag_policy = str(raw_cfg.get("raw_tag_policy") or "allow").strip().lower() or "allow"
+        if raw_tag_policy not in {"allow", "block"}:
+            raw_tag_policy = "allow"
+        events = raw_cfg.get("events") if isinstance(raw_cfg.get("events"), dict) else {}
+        return {
+            "default_style": default_style,
+            "unresolved_policy": unresolved_policy,
+            "raw_tag_policy": raw_tag_policy,
+            "events": events,
+        }
+
+    def _timestamp_placeholder_specs(self) -> dict[str, RecurringTimestampSpec]:
+        cfg = self._timestamp_placeholder_config()
+        default_style = str(cfg.get("default_style") or "f")
+        events = cfg.get("events") if isinstance(cfg.get("events"), dict) else {}
+        out: dict[str, RecurringTimestampSpec] = {}
+        for raw_name, raw_spec in events.items():
+            name = str(raw_name or "").strip()
+            if not TIMESTAMP_EVENT_NAME_RE.fullmatch(name):
+                continue
+            if not isinstance(raw_spec, dict):
+                continue
+            try:
+                out[name] = RecurringTimestampSpec(
+                    weekday=int(raw_spec.get("weekday")),
+                    hour=int(raw_spec.get("hour")),
+                    minute=int(raw_spec.get("minute")),
+                    timezone=str(raw_spec.get("timezone") or "").strip(),
+                    style=str(raw_spec.get("style") or default_style).strip() or default_style,
+                )
+            except Exception:
+                continue
+        return out
+
+    def _allowed_timestamp_placeholder_names(self) -> list[str]:
+        return sorted(self._timestamp_placeholder_specs().keys())
+
+    def _render_timestamp_placeholders(
+        self,
+        text: str,
+        *,
+        enforce_policies: bool,
+        now: datetime | None = None,
+    ) -> TimestampRenderResult:
+        cfg = self._timestamp_placeholder_config()
+        unresolved_policy = str(cfg.get("unresolved_policy") or "passthrough")
+        raw_tag_policy = str(cfg.get("raw_tag_policy") or "allow")
+        if not enforce_policies:
+            unresolved_policy = "passthrough"
+            raw_tag_policy = "allow"
+        return render_named_timestamp_placeholders(
+            text or "",
+            events=self._timestamp_placeholder_specs(),
+            default_style=str(cfg.get("default_style") or "f"),
+            unresolved_policy=unresolved_policy,
+            raw_tag_policy=raw_tag_policy,
+            now=now,
+        )
 
     def _day_key_for_date(self, target_date_local: str) -> str:
         dt = datetime.strptime(target_date_local, "%Y-%m-%d").date()
@@ -571,12 +702,32 @@ class AnnouncementService:
             events, summaries = await self.recall_memory_func(query, scope="warm")
             memory_pack = self.format_memory_for_llm(events, summaries, max_chars=1400)
 
+        placeholder_names = self._allowed_timestamp_placeholder_names()
+        if placeholder_names:
+            placeholder_guidance = (
+                "Timestamp placeholders:\n"
+                "- Never output <t:...> directly.\n"
+                "- Never compute Unix timestamps.\n"
+                "- Use only named placeholders in the format {{DISCORD_TS:event_name}}.\n"
+                f"- Allowed event_name values: {', '.join(placeholder_names)}.\n\n"
+            )
+        else:
+            placeholder_guidance = (
+                "Timestamp placeholders:\n"
+                "- Never output <t:...> directly.\n"
+                "- Never compute Unix timestamps.\n"
+                "- If a timestamp is needed, use {{DISCORD_TS:event_name}} and keep event_name concise.\n\n"
+            )
+
         sys_prompt = (
             "You are Epoxy's announcement drafting assistant.\n"
             "Generate a concise, publish-ready Discord announcement.\n"
             "Follow tone and structure exactly. Use provided answers and memory context if present.\n"
             "Do not invent concrete claims not supported by inputs.\n"
             "If style guidance references are provided, use them only to infer voice and structure; do not copy wording.\n"
+            "Never output Discord <t:...> tags directly.\n"
+            "Never compute Unix timestamps.\n"
+            "Use only named placeholders in the format {{DISCORD_TS:event_name}} for timestamps.\n"
             "If required inputs are missing, keep TODO(question_id) markers in the draft."
         )
         style_block = self._style_prompt_block(day)
@@ -589,6 +740,7 @@ class AnnouncementService:
             f"Q&A inputs:\n{qa_block}\n\n"
             f"Relevant memory context:\n{memory_pack or '(none)'}\n\n"
             f"{style_section}"
+            f"{placeholder_guidance}"
             "Return only the announcement body."
         )
 
@@ -608,6 +760,14 @@ class AnnouncementService:
             draft_text = self._fallback_draft(target_date_local=target_date_local, day=day, answers_map=answers_map)
 
         draft_text = self._enforce_todo_markers(draft_text, missing_required)
+        preview_text = draft_text
+        preview_render_error: str | None = None
+        preview_result: TimestampRenderResult | None = None
+        try:
+            preview_result = self._render_timestamp_placeholders(draft_text, enforce_policies=False)
+            preview_text = preview_result.text
+        except Exception as e:
+            preview_render_error = str(e)[:200]
 
         async with self.db_lock:
             updated = await asyncio.to_thread(
@@ -624,9 +784,16 @@ class AnnouncementService:
                 action="draft_generated",
                 actor_type="user" if actor_user_id else "system",
                 actor_user_id=int(actor_user_id) if actor_user_id is not None else None,
-                payload={"missing_required": missing_required, "answers": len(answers_map)},
+                payload={
+                    "missing_required": missing_required,
+                    "answers": len(answers_map),
+                    "timestamp_preview_resolved_count": int(preview_result.resolved_count) if preview_result else 0,
+                    "timestamp_preview_unresolved": list(preview_result.unresolved_names) if preview_result else [],
+                    "timestamp_preview_raw_tag_count": int(preview_result.raw_tag_count) if preview_result else 0,
+                    "timestamp_preview_render_error": preview_render_error,
+                },
             )
-        return (True, f"Draft generated for {target_date_local}.", draft_text if updated else draft_text)
+        return (True, f"Draft generated for {target_date_local}.", preview_text if updated else preview_text)
 
     async def set_override(
         self,
@@ -959,13 +1126,71 @@ class AnnouncementService:
     async def _publish_cycle(self, bot, cycle: dict[str, Any], *, actor_type: str, actor_user_id: int | None) -> tuple[bool, str]:
         if str(cycle.get("status")) != "approved":
             return (False, f"Cycle status is {cycle.get('status')}; not publishable.")
-        final_text = ((cycle.get("override_text") or "").strip() or (cycle.get("draft_text") or "").strip())
-        if not final_text:
+        source_text = ((cycle.get("override_text") or "").strip() or (cycle.get("draft_text") or "").strip())
+        if not source_text:
             return (False, "No draft/override text available.")
         target_channel_id = int(cycle.get("target_channel_id") or 0)
         if target_channel_id <= 0:
             return (False, "Target channel id is missing.")
+        ts_cfg = self._timestamp_placeholder_config()
 
+        render_result: TimestampRenderResult
+        try:
+            render_result = self._render_timestamp_placeholders(source_text, enforce_policies=True)
+        except Exception as e:
+            err = f"Timestamp render failed: {str(e)[:180]}"
+            async with self.db_lock:
+                _ = await asyncio.to_thread(
+                    update_cycle_fields_sync,
+                    self.db_conn,
+                    int(cycle["id"]),
+                    {"last_error": err[:300]},
+                )
+                await asyncio.to_thread(
+                    insert_audit_log_sync,
+                    self.db_conn,
+                    cycle_id=int(cycle["id"]),
+                    action="post_blocked_render",
+                    actor_type=actor_type,
+                    actor_user_id=actor_user_id,
+                    payload={
+                        "error": err,
+                        "target_channel_id": target_channel_id,
+                        "unresolved_policy": ts_cfg.get("unresolved_policy"),
+                        "raw_tag_policy": ts_cfg.get("raw_tag_policy"),
+                    },
+                )
+            return (False, err)
+
+        if render_result.blocked:
+            reason = f"Timestamp policy blocked publish ({render_result.block_reason})."
+            async with self.db_lock:
+                _ = await asyncio.to_thread(
+                    update_cycle_fields_sync,
+                    self.db_conn,
+                    int(cycle["id"]),
+                    {"last_error": reason[:300]},
+                )
+                await asyncio.to_thread(
+                    insert_audit_log_sync,
+                    self.db_conn,
+                    cycle_id=int(cycle["id"]),
+                    action="post_blocked_render",
+                    actor_type=actor_type,
+                    actor_user_id=actor_user_id,
+                    payload={
+                        "reason": render_result.block_reason,
+                        "target_channel_id": target_channel_id,
+                        "resolved_count": int(render_result.resolved_count),
+                        "unresolved_names": list(render_result.unresolved_names),
+                        "raw_tag_count": int(render_result.raw_tag_count),
+                        "unresolved_policy": ts_cfg.get("unresolved_policy"),
+                        "raw_tag_policy": ts_cfg.get("raw_tag_policy"),
+                    },
+                )
+            return (False, reason)
+
+        final_text = render_result.text
         posted_message_id: int | None = None
         if not self.dry_run:
             channel = await self._get_channel(bot, target_channel_id)
@@ -995,6 +1220,13 @@ class AnnouncementService:
                     "posted_message_id": posted_message_id,
                     "target_channel_id": target_channel_id,
                     "chars": len(final_text),
+                    "source_chars": len(source_text),
+                    "timestamp_resolved_count": int(render_result.resolved_count),
+                    "timestamp_unresolved_names": list(render_result.unresolved_names),
+                    "timestamp_raw_tag_count": int(render_result.raw_tag_count),
+                    "timestamp_block_reason": render_result.block_reason,
+                    "timestamp_unresolved_policy": ts_cfg.get("unresolved_policy"),
+                    "timestamp_raw_tag_policy": ts_cfg.get("raw_tag_policy"),
                 },
             )
         if posted:
