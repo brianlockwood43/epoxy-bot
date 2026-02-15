@@ -199,7 +199,7 @@ Make candidate review operational with explicit approve/reject actions and audit
 ### Scope
 1. Add review commands:
 - `!memreview [limit]`
-- `!memapprove <id> [tags=...] [topic=...] [importance=0|1] [note=...]`
+- `!memapprove <id> [tags=...] [topic=...] [importance=<0..4 or 0.0..1.0>] [note=...]`
 - `!memreject <id> [reason=...]`
 
 2. Add audit persistence for lifecycle and metadata edits.
@@ -214,6 +214,10 @@ Migration: `0019_memory_review_audit.py`
 2. Add table:
 - `memory_audit_log(id, memory_id, action, actor_person_id, before_json, after_json, reason, created_at_utc)`
 
+3. Modernize `memory_events.importance` to REAL semantics:
+- `importance REAL DEFAULT 0.5`
+- Normalize and clamp copied values into `[0.0, 1.0]` during migration rebuild.
+
 ### Implementation
 1. New module: `memory/lifecycle_service.py`
 - `list_candidate_memories_sync`
@@ -223,12 +227,21 @@ Migration: `0019_memory_review_audit.py`
 
 2. Commands in `misc/commands/commands_memory.py`.
 3. Wire person identity for actor ids via existing identity store.
+4. `!memapprove` importance parsing rules:
+- integer tier `0..4` maps to `0.00, 0.25, 0.50, 0.75, 1.00`.
+- otherwise parse float and clamp to `[0.0, 1.0]`.
+- omitted importance on approve defaults to `0.50`.
 
 ### Acceptance Criteria
 1. `!memreview` lists candidate items only.
 2. `!memapprove` transitions candidate -> active and applies optional metadata edits.
 3. `!memreject` transitions candidate -> deprecated.
 4. Each action writes one `memory_audit_log` row with before/after snapshots.
+5. `!memapprove importance=3` stores `0.75`.
+6. `!memapprove importance=0.9` stores `0.9`.
+7. `!memapprove` with omitted importance stores `0.5`.
+8. Invalid importance input returns deterministic parse error.
+9. Audit snapshots store normalized float importance values.
 
 ### Tests
 1. `tests/test_memory_review_commands.py`
@@ -415,6 +428,9 @@ Use flex budget dynamically by situation profile and layer weights.
 1. Compute per-layer flex quotas.
 2. Score/rank candidates by participant/topic/scope/importance/recency.
 3. Penalize or suppress jokes for high seriousness.
+4. Importance scoring contract:
+- apply importance as a multiplier (`score *= (0.6 + 0.4 * importance)`).
+- do not use importance as a hard exclusion gate.
 
 ### Implementation
 1. Extend `memory/meta_retrieval.py`:
@@ -437,6 +453,8 @@ Use flex budget dynamically by situation profile and layer weights.
 ### Risks
 1. Overly rigid allocation.
 Mitigation: deterministic rebalancing when some layers are sparse.
+2. Stale high-importance items could dominate without recency balance.
+Mitigation: keep importance multiplicative and preserve recency/policy/lifecycle gating.
 
 ---
 
@@ -641,4 +659,3 @@ Done means all are true:
 4. Relational contracts directly influence runtime mode blend.
 5. Policy constraints remain hard-precedence and regression-tested.
 6. Eval gates exist and are required before enabling layered retrieval by default.
-

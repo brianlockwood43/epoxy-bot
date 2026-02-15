@@ -148,11 +148,23 @@ def resolve_memory_lifecycle(
     return "candidate"
 
 
+def normalize_importance_value(raw: Any, *, default: float = 0.5) -> float:
+    try:
+        value = float(raw)
+    except Exception:
+        value = float(default)
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return float(value)
+
+
 async def remember_event(
     *,
     text: str,
     tags: list[str] | None,
-    importance: int,
+    importance: float | int,
     message: Any | None = None,
     topic_hint: str | None = None,
     memory_review_mode: str = "capture_only",
@@ -271,7 +283,7 @@ async def remember_event(
         "author_name": author_name,
         "text": (text or "").strip(),
         "tags_json": safe_json_dumps(tags),
-        "importance": int(1 if importance else 0),
+        "importance": normalize_importance_value(importance, default=0.5),
         "tier": int(tier),
         "topic_id": topic_id,
         "topic_source": topic_source,

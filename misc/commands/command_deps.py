@@ -48,6 +48,9 @@ class CommandDeps:
     subject_user_tag: Callable[[int], str] | None = None
     subject_person_tag: Callable[[int], str] | None = None
     get_or_create_person_sync: Callable | None = None
+    list_candidate_memories_sync: Callable | None = None
+    approve_memory_sync: Callable | None = None
+    reject_memory_sync: Callable | None = None
     parse_channel_id_token: Callable | None = None
     parse_duration_to_minutes: Callable | None = None
     fetch_messages_since_sync: Callable | None = None

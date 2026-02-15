@@ -6,6 +6,18 @@ import time
 from typing import Any, Callable
 
 
+def _normalize_importance_value(raw: Any, *, default: float = 0.5) -> float:
+    try:
+        value = float(raw)
+    except Exception:
+        value = float(default)
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return float(value)
+
+
 def insert_memory_event_sync(
     conn: sqlite3.Connection,
     payload: dict[str, Any],
@@ -52,7 +64,7 @@ def insert_memory_event_sync(
             payload.get("lifecycle", "active"),
             payload["text"],
             payload.get("tags_json", "[]"),
-            int(payload.get("importance", 0)),
+            _normalize_importance_value(payload.get("importance"), default=0.5),
             int(payload.get("tier", 1)),
             payload.get("topic_id"),
             payload.get("topic_source", "none"),
@@ -306,12 +318,12 @@ def search_memory_events_sync(
         if tier not in allowed_tiers:
             continue
 
-        importance = int(importance or 0)
+        importance = _normalize_importance_value(importance, default=0.5)
         if stage_at_least("M1") and not stage_at_least("M2"):
-            if importance == 0 and (now - int(created_ts or 0)) > 14 * 86400:
+            if importance <= 0.0 and (now - int(created_ts or 0)) > 14 * 86400:
                 continue
         if stage_at_least("M2"):
-            if importance == 0 and tier >= 3:
+            if importance <= 0.0 and tier >= 3:
                 continue
 
         base = -float(rank or 0.0)
@@ -324,7 +336,7 @@ def search_memory_events_sync(
         else:
             recency_boost = 0.0
 
-        importance_boost = 2.0 if importance == 1 else 0.0
+        importance_boost = 2.0 * float(importance)
         score = base + recency_boost + importance_boost
 
         scored.append(
@@ -487,7 +499,7 @@ def cleanup_memory_sync(
             SET lifecycle='archived',
                 updated_at_utc=?
             WHERE COALESCE(lifecycle, 'active')='active'
-              AND importance=0
+              AND COALESCE(importance, 0.5) <= 0.0
               AND created_ts < ?
             """,
             (now_iso_utc, now - 14 * 86400),
@@ -500,7 +512,7 @@ def cleanup_memory_sync(
             SET lifecycle='archived',
                 updated_at_utc=?
             WHERE COALESCE(lifecycle, 'active')='active'
-              AND importance=0
+              AND COALESCE(importance, 0.5) <= 0.0
               AND created_ts < ?
             """,
             (now_iso_utc, now - 90 * 86400),
@@ -565,7 +577,7 @@ def fetch_topic_events_sync(
         """
         SELECT id, created_at_utc, created_ts, channel_name, author_name, text, tags_json
         FROM memory_events
-        WHERE importance = 1
+        WHERE COALESCE(importance, 0.5) >= 0.5
           AND summarized = 0
           AND COALESCE(lifecycle, 'active') = 'active'
           AND (? IS NULL OR channel_id = ? OR scope = ?)

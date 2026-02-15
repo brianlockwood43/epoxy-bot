@@ -5,8 +5,124 @@ import json
 import re
 
 from discord.ext import commands
+from memory.lifecycle_service import MemoryLifecycleError
 from misc.commands.command_deps import CommandDeps
 from misc.commands.command_deps import CommandGates
+
+
+IMPORTANCE_TIER_MAP: dict[int, float] = {
+    0: 0.0,
+    1: 0.25,
+    2: 0.5,
+    3: 0.75,
+    4: 1.0,
+}
+
+
+def _shorten(text: str, limit: int) -> str:
+    clean = " ".join((text or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(0, limit - 3)] + "..."
+
+
+def _parse_memapprove_importance(raw_value: str) -> float:
+    token = str(raw_value or "").strip()
+    if not token:
+        raise ValueError("importance token is empty")
+
+    if re.fullmatch(r"[+-]?\d+", token):
+        as_int = int(token)
+        if 0 <= as_int <= 4:
+            return float(IMPORTANCE_TIER_MAP[as_int])
+
+    try:
+        as_float = float(token)
+    except Exception as exc:
+        raise ValueError("invalid importance") from exc
+
+    if as_float < 0.0:
+        return 0.0
+    if as_float > 1.0:
+        return 1.0
+    return float(as_float)
+
+
+def _parse_memapprove_args(raw: str) -> tuple[int, list[str] | None, str | None, float | None, str | None, str | None]:
+    text = (raw or "").strip()
+    if not text:
+        return (
+            0,
+            None,
+            None,
+            None,
+            None,
+            "Usage: `!memapprove <id> [tags=...] [topic=...] [importance=<0..4 or 0.0..1.0>] [note=...]`",
+        )
+
+    parts = text.split(maxsplit=1)
+    try:
+        memory_id = int(parts[0])
+    except Exception:
+        return (0, None, None, None, None, "First argument must be a memory id integer.")
+
+    tail = parts[1] if len(parts) > 1 else ""
+    tags: list[str] | None = None
+    topic_id: str | None = None
+    importance: float | None = None
+    note: str | None = None
+
+    m_tags = re.search(r"(?:^|\s)tags=([^\s]+)", tail)
+    if m_tags:
+        tags = [t.strip() for t in re.split(r"[;,]+", m_tags.group(1)) if t.strip()]
+
+    m_topic = re.search(r"(?:^|\s)topic=([^\s]+)", tail)
+    if m_topic:
+        raw_topic = str(m_topic.group(1) or "").strip()
+        topic_id = raw_topic or None
+
+    m_imp = re.search(r"(?:^|\s)importance=([^\s]+)", tail)
+    if m_imp:
+        raw_imp = str(m_imp.group(1) or "").strip()
+        try:
+            importance = _parse_memapprove_importance(raw_imp)
+        except ValueError:
+            return (
+                0,
+                None,
+                None,
+                None,
+                None,
+                "Invalid `importance`; expected tier `0..4` or float `0.0..1.0`.",
+            )
+
+    m_note = re.search(r"(?:^|\s)note=(.+)$", tail)
+    if m_note:
+        note = str(m_note.group(1) or "").strip() or None
+
+    return (memory_id, tags, topic_id, importance, note, None)
+
+
+def _parse_memreject_args(raw: str) -> tuple[int, str | None, str | None]:
+    text = (raw or "").strip()
+    if not text:
+        return (0, None, "Usage: `!memreject <id> [reason=...]`")
+
+    parts = text.split(maxsplit=1)
+    try:
+        memory_id = int(parts[0])
+    except Exception:
+        return (0, None, "First argument must be a memory id integer.")
+
+    tail = parts[1] if len(parts) > 1 else ""
+    if not tail:
+        return (memory_id, None, None)
+
+    m_reason = re.search(r"(?:^|\s)reason=(.+)$", tail)
+    if not m_reason:
+        return (0, None, "Usage: `!memreject <id> [reason=...]`")
+    reason = str(m_reason.group(1) or "").strip() or None
+    return (memory_id, reason, None)
 
 
 def register(
@@ -40,6 +156,158 @@ def register(
             f"Memory stage: **{deps.memory_stage}** (rank={deps.memory_stage_rank}) | "
             f"AUTO_CAPTURE={'1' if deps.auto_capture else '0'} | AUTO_SUMMARY={'1' if deps.auto_summary else '0'} | "
             f"REVIEW_MODE={deps.memory_review_mode}"
+        )
+
+    @bot.command(name="memreview")
+    async def memreview_cmd(ctx: commands.Context, limit: int = 20):
+        if not gates.in_allowed_channel(ctx):
+            return
+        if not gates.user_is_owner(ctx.author):
+            await ctx.send("This command is owner-only.")
+            return
+        if deps.list_candidate_memories_sync is None:
+            await ctx.send("Memory review service is not configured.")
+            return
+
+        lim = max(1, min(int(limit or 20), 100))
+        async with deps.db_lock:
+            rows = await asyncio.to_thread(
+                deps.list_candidate_memories_sync,
+                deps.db_conn,
+                lim,
+                0,
+            )
+
+        if not rows:
+            await ctx.send("No candidate memories in review queue.")
+            return
+
+        lines = [f"Candidate memories (latest {len(rows)}):"]
+        for row in rows:
+            mem_id = int(row.get("id", 0))
+            created = str(row.get("created_at_utc") or "?")
+            scope = str(row.get("scope") or "global")
+            importance = float(row.get("importance") or 0.0)
+            topic = str(row.get("topic_id") or "-")
+            text = _shorten(str(row.get("text") or ""), 80)
+            lines.append(
+                f"- #{mem_id} [{created}] scope={scope} imp={importance:.2f} topic={topic} :: {text}"
+            )
+        await deps.send_chunked(ctx.channel, "```\n" + "\n".join(lines)[:7000] + "\n```")
+
+    @bot.command(name="memapprove")
+    async def memapprove_cmd(ctx: commands.Context, *, raw: str = ""):
+        if not gates.in_allowed_channel(ctx):
+            return
+        if not gates.user_is_owner(ctx.author):
+            await ctx.send("This command is owner-only.")
+            return
+        if deps.approve_memory_sync is None or deps.get_or_create_person_sync is None:
+            await ctx.send("Memory review service is not configured.")
+            return
+
+        memory_id, tags, topic_id, importance, note, parse_err = _parse_memapprove_args(raw)
+        if parse_err:
+            await ctx.send(parse_err)
+            return
+
+        person_origin = f"discord:{int(ctx.guild.id)}" if getattr(ctx, "guild", None) is not None else "discord:dm"
+        try:
+            async with deps.db_lock:
+                actor_person_id = await asyncio.to_thread(
+                    deps.get_or_create_person_sync,
+                    deps.db_conn,
+                    platform="discord",
+                    external_id=str(int(ctx.author.id)),
+                    origin=person_origin,
+                    label="discord_user_id",
+                )
+                updated = await asyncio.to_thread(
+                    deps.approve_memory_sync,
+                    deps.db_conn,
+                    memory_id=int(memory_id),
+                    actor_person_id=int(actor_person_id),
+                    tags=tags,
+                    topic_id=topic_id,
+                    importance=importance,
+                    note=note,
+                )
+        except MemoryLifecycleError as exc:
+            if exc.code == "not_found":
+                await ctx.send(f"Memory #{int(memory_id)} not found.")
+                return
+            if exc.code == "not_candidate":
+                await ctx.send(f"Memory #{int(memory_id)} must be `candidate` before approval.")
+                return
+            await ctx.send(f"Approve failed: {exc}")
+            return
+        except Exception as exc:
+            await ctx.send(f"Approve failed: {exc}")
+            return
+
+        applied_bits = []
+        if tags is not None:
+            applied_bits.append(f"tags={updated.get('tags', [])}")
+        if topic_id is not None:
+            applied_bits.append(f"topic={updated.get('topic_id') or '(none)'}")
+        applied_bits.append(f"importance={float(updated.get('importance') or 0.0):.2f}")
+        if note is not None:
+            applied_bits.append("note=updated")
+        applied_txt = "; ".join(applied_bits) if applied_bits else "(no metadata edits)"
+
+        await ctx.send(
+            f"Approved memory #{int(updated.get('id') or memory_id)} -> lifecycle=active. {applied_txt}"
+        )
+
+    @bot.command(name="memreject")
+    async def memreject_cmd(ctx: commands.Context, *, raw: str = ""):
+        if not gates.in_allowed_channel(ctx):
+            return
+        if not gates.user_is_owner(ctx.author):
+            await ctx.send("This command is owner-only.")
+            return
+        if deps.reject_memory_sync is None or deps.get_or_create_person_sync is None:
+            await ctx.send("Memory review service is not configured.")
+            return
+
+        memory_id, reason, parse_err = _parse_memreject_args(raw)
+        if parse_err:
+            await ctx.send(parse_err)
+            return
+
+        person_origin = f"discord:{int(ctx.guild.id)}" if getattr(ctx, "guild", None) is not None else "discord:dm"
+        try:
+            async with deps.db_lock:
+                actor_person_id = await asyncio.to_thread(
+                    deps.get_or_create_person_sync,
+                    deps.db_conn,
+                    platform="discord",
+                    external_id=str(int(ctx.author.id)),
+                    origin=person_origin,
+                    label="discord_user_id",
+                )
+                updated = await asyncio.to_thread(
+                    deps.reject_memory_sync,
+                    deps.db_conn,
+                    memory_id=int(memory_id),
+                    actor_person_id=int(actor_person_id),
+                    reason=reason,
+                )
+        except MemoryLifecycleError as exc:
+            if exc.code == "not_found":
+                await ctx.send(f"Memory #{int(memory_id)} not found.")
+                return
+            if exc.code == "not_candidate":
+                await ctx.send(f"Memory #{int(memory_id)} must be `candidate` before rejection.")
+                return
+            await ctx.send(f"Reject failed: {exc}")
+            return
+        except Exception as exc:
+            await ctx.send(f"Reject failed: {exc}")
+            return
+
+        await ctx.send(
+            f"Rejected memory #{int(updated.get('id') or memory_id)} -> lifecycle=deprecated."
         )
 
     @bot.command(name="topics")

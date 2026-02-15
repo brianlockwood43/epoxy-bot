@@ -68,6 +68,9 @@ from jobs.announcements import announcement_loop as announcement_loop_service
 from memory.meta_service import apply_policy_enforcement as apply_policy_enforcement_service
 from memory.meta_service import format_policy_directive as format_policy_directive_service
 from memory.meta_store import resolve_policy_bundle_sync as resolve_policy_bundle_store
+from memory.lifecycle_service import approve_memory_sync as approve_memory_service
+from memory.lifecycle_service import list_candidate_memories_sync as list_candidate_memories_service
+from memory.lifecycle_service import reject_memory_sync as reject_memory_service
 from memory.service import extract_json_array as extract_json_array_service
 from memory.service import get_topic_candidates as get_topic_candidates_service
 from memory.service import remember_event as remember_event_service
@@ -657,6 +660,62 @@ def _insert_memory_event_sync(conn: sqlite3.Connection, payload: dict) -> int:
         safe_json_loads=safe_json_loads,
     )
 
+
+def _list_candidate_memories_sync(
+    conn: sqlite3.Connection,
+    limit: int = 20,
+    offset: int = 0,
+) -> list[dict]:
+    return list_candidate_memories_service(
+        conn,
+        limit=limit,
+        offset=offset,
+        safe_json_loads=safe_json_loads,
+    )
+
+
+def _approve_memory_sync(
+    conn: sqlite3.Connection,
+    *,
+    memory_id: int,
+    actor_person_id: int | None,
+    tags: list[str] | None = None,
+    topic_id: str | None = None,
+    importance: float | None = None,
+    note: str | None = None,
+) -> dict:
+    return approve_memory_service(
+        conn,
+        memory_id=memory_id,
+        actor_person_id=actor_person_id,
+        tags=tags,
+        topic_id=topic_id,
+        importance=importance,
+        note=note,
+        utc_now_iso=utc_iso,
+        normalize_tags=normalize_tags,
+        safe_json_loads=safe_json_loads,
+        safe_json_dumps=safe_json_dumps,
+    )
+
+
+def _reject_memory_sync(
+    conn: sqlite3.Connection,
+    *,
+    memory_id: int,
+    actor_person_id: int | None,
+    reason: str | None = None,
+) -> dict:
+    return reject_memory_service(
+        conn,
+        memory_id=memory_id,
+        actor_person_id=actor_person_id,
+        reason=reason,
+        utc_now_iso=utc_iso,
+        safe_json_loads=safe_json_loads,
+        safe_json_dumps=safe_json_dumps,
+    )
+
 def _mark_events_summarized_sync(conn: sqlite3.Connection, event_ids: list[int]) -> None:
     mark_events_summarized_store(conn, event_ids)
 
@@ -1194,6 +1253,9 @@ wire_bot_runtime(
     subject_user_tag=subject_user_tag,
     subject_person_tag=subject_person_tag,
     get_or_create_person_sync=get_or_create_person_sync,
+    list_candidate_memories_sync=_list_candidate_memories_sync,
+    approve_memory_sync=_approve_memory_sync,
+    reject_memory_sync=_reject_memory_sync,
     parse_channel_id_token=_parse_channel_id_token,
     parse_duration_to_minutes=_parse_duration_to_minutes,
     fetch_messages_since_sync=_fetch_messages_since_sync,

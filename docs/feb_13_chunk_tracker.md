@@ -23,7 +23,7 @@ Status values:
 | Chunk | Title | Owner | Status | Start Date | End Date | PR/Branch | Notes |
 |---|---|---|---|---|---|---|---|
 | 8 | Memory Review Mode + Candidate Lifecycle | Codex | in_review | 2026-02-15 |  |  | Deferred follow-up: !profile -> meta-memory store after meta-layer expansion; not part of Chunk 8. |
-| 9 | Review Workflow Commands + Audit Log | TBD | planned |  |  |  |  |
+| 9 | Review Workflow Commands + Audit Log | Codex | done | 2026-02-15 | 2026-02-15 |  | Owner-only review commands; global candidate queue; audit log + reviewed fields added; `importance` modernized to REAL with tier/float approve UX. |
 | 10 | Typed Tag Contract + Provenance Field | TBD | planned |  |  |  |  |
 | 11 | Meta Model Expansion + Backbone Registry | TBD | planned |  |  |  |  |
 | 12 | Situation Profile + Meta Budget Resolver | TBD | planned |  |  |  |  |
@@ -86,9 +86,9 @@ Release Decision
 - [ ] Recall paths remain `active`-only.
 
 ## Chunk 9
-- [ ] Commands implemented: `!memreview`, `!memapprove`, `!memreject`.
-- [ ] `memory_audit_log` table exists and is written on every review action.
-- [ ] Review metadata fields persisted on `memory_events`.
+- [x] Commands implemented: `!memreview`, `!memapprove`, `!memreject`.
+- [x] `memory_audit_log` table exists and is written on every review action.
+- [x] Review metadata fields persisted on `memory_events`.
 
 ## Chunk 10
 - [ ] Typed tag contract introduced and validated.

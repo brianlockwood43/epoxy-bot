@@ -201,7 +201,11 @@ def format_memory_for_llm(events: list[dict], summaries: list[dict], max_chars: 
             tags = ",".join(e.get("tags") or [])
             when = e.get("created_at_utc") or "unknown-date"
             who = e.get("author_name") or "unknown-author"
-            imp = "!" if int(e.get("importance") or 0) == 1 else ""
+            try:
+                importance_value = float(e.get("importance") or 0.0)
+            except Exception:
+                importance_value = 0.0
+            imp = "!" if importance_value >= 0.75 else ""
             topic = (e.get("topic_id") or "")
             topic_meta = f"topic={topic} " if topic else ""
 
