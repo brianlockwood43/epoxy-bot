@@ -183,6 +183,57 @@ Use this with:
 - Access: owner-only, allowed channels or allowed-channel threads
 - Purpose: force-send tomorrow prep prompt/thread immediately (no posting)
 
+### Music Commands (Prototype-Risk-Accepted)
+
+All `!music.*` commands are constrained to one configured text channel (`EPOXY_MUSIC_TEXT_CHANNEL_ID`), except:
+- `!music.status` can also be viewed by owners outside that channel.
+
+Playback is constrained to one configured voice channel (`EPOXY_MUSIC_VOICE_CHANNEL_ID`).
+
+1. `!music.start`
+- Access: operator-only (`EPOXY_MUSIC_OPERATOR_USER_IDS`, fallback owner IDs)
+- Purpose: connect Epoxy to configured voice channel and start queued playback if available
+
+2. `!music.stop`
+- Access: operator-only
+- Purpose: stop playback, clear queue, disconnect voice
+
+3. `!music.skip`
+- Access: operator-only
+- Purpose: skip currently playing track
+
+4. `!music.pause`
+- Access: operator-only
+- Purpose: pause playback
+
+5. `!music.resume`
+- Access: operator-only
+- Purpose: resume paused playback
+
+6. `!music.clearqueue`
+- Access: operator-only
+- Purpose: remove queued tracks without disconnecting
+
+7. `!music.forcequeue <youtube_url>`
+- Access: operator-only
+- Purpose: queue a YouTube track while bypassing heuristic genre gate
+
+8. `!music.queue <youtube_url>`
+- Access: users in configured music text channel
+- Purpose: queue a YouTube link if metadata heuristic passes calm/genre constraints
+
+9. `!music.queue_list [n]`
+- Access: users in configured music text channel
+- Purpose: show queued tracks (`n` clamped to `1..50`)
+
+10. `!music.now`
+- Access: users in configured music text channel
+- Purpose: show currently playing track metadata
+
+11. `!music.status`
+- Access: users in configured music text channel; owners can run from elsewhere
+- Purpose: show feature enablement, playback state, queue state, and limits
+
 ---
 
 ## Environment Variables
@@ -415,6 +466,68 @@ For DM draft episodes, `implicit_signals_json` includes structured artifact keys
 8. `EPOXY_ANNOUNCE_TEMPLATES_PATH`
 - Default: `config/announcement_templates.yml`
 - Template file path override
+
+### Calm/Chill Music Prototype (YouTube Voice)
+
+1. `EPOXY_MUSIC_ENABLED`
+- Default: `0`
+- Master toggle for `!music.*` command surface
+
+2. `EPOXY_MUSIC_RISK_ACK`
+- Required value for live enablement: `I_ACCEPT_YOUTUBE_RISK`
+- If missing/mismatched, music commands return disabled status
+
+3. `EPOXY_MUSIC_TEXT_CHANNEL_ID`
+- Default: `0` (disabled until configured)
+- Only channel where queue/control commands are accepted (except owner `!music.status`)
+
+4. `EPOXY_MUSIC_VOICE_CHANNEL_ID`
+- Default: `0` (disabled until configured)
+- Voice destination Epoxy is allowed to connect to
+
+5. `EPOXY_MUSIC_OPERATOR_USER_IDS`
+- Optional
+- Operator IDs for control commands; falls back to owner IDs if unset
+
+6. `EPOXY_MUSIC_QUEUE_MAX`
+- Default: `25`
+- Max total queue depth
+
+7. `EPOXY_MUSIC_MAX_PER_USER`
+- Default: `3`
+- Max queued items per user
+
+8. `EPOXY_MUSIC_QUEUE_COOLDOWN_SECONDS`
+- Default: `30`
+- Minimum delay between queue requests per user
+
+9. `EPOXY_MUSIC_IDLE_DISCONNECT_SECONDS`
+- Default: `600`
+- Auto-disconnect delay when queue is empty and playback is idle
+
+10. `EPOXY_MUSIC_YT_MIN_SCORE`
+- Default: `2`
+- Minimum metadata heuristic score for non-operator queue requests
+
+11. `EPOXY_MUSIC_YT_ALLOW_KEYWORDS`
+- Default: `lofi,lo-fi,chillhop,smooth jazz,nu jazz,jazzhop,study beats`
+- Positive keyword list used by metadata scoring
+
+12. `EPOXY_MUSIC_YT_DENY_KEYWORDS`
+- Default: `phonk,hardstyle,dubstep,drill,trap,nightcore,bass boosted`
+- Negative keyword list used by metadata scoring
+
+13. `EPOXY_MUSIC_MIN_DURATION_SECONDS`
+- Default: `90`
+- Minimum accepted video duration for queue intake
+
+14. `EPOXY_MUSIC_MAX_DURATION_SECONDS`
+- Default: `7200`
+- Maximum accepted video duration for queue intake
+
+15. `EPOXY_MUSIC_DRY_RUN`
+- Default: `0`
+- If `1`, commands and queueing work but voice playback operations are simulated
 
 ---
 

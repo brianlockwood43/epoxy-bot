@@ -44,12 +44,14 @@ def insert_memory_event_sync(
             author_id, author_name,
             source_message_id,
             lifecycle,
+            type,
             text, tags_json, importance, tier,
+            provenance_json,
             topic_id, topic_source, topic_confidence,
             summarized,
             logged_from_channel_id, logged_from_channel_name, logged_from_message_id,
             source_channel_id, source_channel_name
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload["created_at_utc"],
@@ -62,10 +64,12 @@ def insert_memory_event_sync(
             payload.get("author_name"),
             payload.get("source_message_id"),
             payload.get("lifecycle", "active"),
+            str(payload.get("type") or "event"),
             payload["text"],
             payload.get("tags_json", "[]"),
             _normalize_importance_value(payload.get("importance"), default=0.5),
             int(payload.get("tier", 1)),
+            payload.get("provenance_json", "{}"),
             payload.get("topic_id"),
             payload.get("topic_source", "none"),
             payload.get("topic_confidence"),

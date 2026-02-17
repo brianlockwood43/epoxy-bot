@@ -7,6 +7,7 @@ from misc.commands.command_deps import CommandGates
 from misc.commands.commands_announcements import register as register_announcements
 from misc.commands.commands_community import register as register_community
 from misc.commands.commands_memory import register as register_memory
+from misc.commands.commands_music import register as register_music
 from misc.commands.commands_mining import register as register_mining
 from misc.commands.commands_owner import register as register_owner
 from misc.runtime_deps import RuntimeBootDeps
@@ -111,6 +112,7 @@ def wire_bot_runtime(
     announcement_enabled: bool,
     announcement_service,
     announcement_loop_func,
+    music_service,
 ) -> None:
     def in_allowed_channel(ctx) -> bool:
         try:
@@ -172,6 +174,7 @@ def wire_bot_runtime(
         paddock_lounge_channel_id=paddock_lounge_channel_id,
         lfg_role_name=lfg_role_name,
         announcement_service=announcement_service,
+        music_service=music_service,
     )
     command_gates = CommandGates(
         in_allowed_channel=in_allowed_channel,
@@ -206,6 +209,13 @@ def wire_bot_runtime(
 
     if announcement_service is not None:
         register_announcements(
+            bot,
+            deps=command_deps,
+            gates=command_gates,
+        )
+
+    if music_service is not None:
+        register_music(
             bot,
             deps=command_deps,
             gates=command_gates,

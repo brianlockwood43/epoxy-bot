@@ -5,6 +5,10 @@ import json
 import re
 from typing import Any
 
+from memory.tagging import extract_kind
+from memory.tagging import extract_topics
+from memory.tagging import normalize_memory_tags
+
 
 async def get_topic_candidates(
     *,
@@ -190,18 +194,20 @@ async def remember_event(
     if not stage_at_least("M1"):
         return None
 
-    tags = normalize_tags(tags or [])
+    source_tag = str(source_path or "").strip().lower() or "manual"
+    raw_tags = list(tags or [])
+    if source_tag:
+        raw_tags.append(f"source:{source_tag}")
+    tags = normalize_memory_tags(raw_tags, preserve_legacy=True)
 
     topic_id: str | None = None
     if topic_hint:
-        hinted = normalize_tags([topic_hint])
-        topic_id = hinted[0] if hinted else None
+        hinted_topics = extract_topics(normalize_memory_tags([topic_hint], preserve_legacy=True))
+        topic_id = hinted_topics[0] if hinted_topics else None
 
     if not topic_id and tags:
-        for t in tags:
-            if t and t not in reserved_kind_tags:
-                topic_id = t
-                break
+        topics = extract_topics(tags)
+        topic_id = topics[0] if topics else None
 
     topic_source = "manual" if topic_id else "none"
     topic_confidence: float | None = None
@@ -224,10 +230,10 @@ async def remember_event(
             topic_id = sug
             topic_source = "suggested"
             topic_confidence = conf
-            if topic_id not in tags:
-                tags = [topic_id] + tags
+            tags = normalize_memory_tags(list(tags) + [f"topic:{topic_id}", topic_id], preserve_legacy=True)
 
-    tags = normalize_tags(tags)
+    tags = normalize_memory_tags(tags, preserve_legacy=True)
+    memory_type = extract_kind(tags) or "event"
 
     created_dt = None
     guild_id = None
@@ -242,6 +248,10 @@ async def remember_event(
     source_channel_id = None
     source_channel_name = None
 
+    provenance: dict[str, str] = {}
+    if source_tag:
+        provenance["source"] = source_tag
+
     if message is not None:
         created_dt = message.created_at if message.created_at else None
         guild_id = message.guild.id if message.guild else None
@@ -253,6 +263,11 @@ async def remember_event(
         source_message_id = message.id
         author_id = message.author.id
         author_name = str(message.author)
+        provenance["surface"] = "dm" if message.guild is None else "public_channel"
+        provenance["channel_id"] = str(int(message.channel.id))
+        provenance["message_id"] = str(int(message.id))
+    else:
+        provenance["surface"] = "system_job"
 
     created_ts = utc_ts(created_dt) if created_dt else utc_ts()
     tier = infer_tier(created_ts) if stage_at_least("M2") else 1
@@ -281,8 +296,10 @@ async def remember_event(
         "source_channel_name": source_channel_name,
         "author_id": author_id,
         "author_name": author_name,
+        "type": memory_type,
         "text": (text or "").strip(),
         "tags_json": safe_json_dumps(tags),
+        "provenance_json": safe_json_dumps(provenance),
         "importance": normalize_importance_value(importance, default=0.5),
         "tier": int(tier),
         "topic_id": topic_id,
@@ -304,5 +321,6 @@ async def remember_event(
         "topic_id": topic_id,
         "topic_source": topic_source,
         "topic_confidence": topic_confidence,
+        "type": memory_type,
         "tags": tags,
     }

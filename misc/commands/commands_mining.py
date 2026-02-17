@@ -6,6 +6,7 @@ from datetime import timedelta
 
 import discord
 from discord.ext import commands
+from memory.tagging import normalize_memory_tags
 from misc.commands.command_deps import CommandDeps
 from misc.commands.command_deps import CommandGates
 
@@ -156,9 +157,9 @@ Rules:
             if conf < 0.55:
                 continue
 
-            tags = [kind]
+            tags = normalize_memory_tags([kind], preserve_legacy=True)
             if topic_id:
-                tags = [topic_id] + tags
+                tags = normalize_memory_tags([topic_id] + tags, preserve_legacy=True)
 
             res = await deps.remember_event_func(
                 text=text,

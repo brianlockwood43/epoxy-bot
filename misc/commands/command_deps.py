@@ -74,6 +74,7 @@ class CommandDeps:
 
     # Ad-hoc modules
     announcement_service: Any = None
+    music_service: Any = None
 
 
 @dataclass(frozen=True)

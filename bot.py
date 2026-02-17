@@ -93,6 +93,7 @@ from memory.store import upsert_summary_sync as upsert_summary_store
 from misc.runtime_wiring import wire_bot_runtime
 from misc.adhoc_modules.announcements_service import AnnouncementService
 from misc.adhoc_modules.announcements_service import default_templates_path as announcement_templates_path_default
+from misc.adhoc_modules.music_service import MusicService
 from misc.adhoc_modules.welcome_panel import build_welcome_panel
 from retrieval.service import budget_and_diversify_events as retrieval_budget_and_diversify_events
 from retrieval.fts_query import build_fts_query
@@ -273,6 +274,65 @@ else:
         f"[CFG] dm_guidelines={DM_GUIDELINES.version} "
         f"source={DM_GUIDELINES_SOURCE} path={DM_GUIDELINES_PATH}"
     )
+
+
+# =========================
+# MUSIC (CALM/CHILL YOUTUBE)
+# =========================
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.getenv(name, str(default)) or "").strip()
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def _env_keywords(name: str, default_csv: str) -> list[str]:
+    raw = os.getenv(name, default_csv)
+    if raw is None:
+        raw = default_csv
+    out: list[str] = []
+    for token in re.split(r"[,;]+", str(raw)):
+        clean = str(token).strip().lower()
+        if clean:
+            out.append(clean)
+    # stable + dedupe
+    return sorted(set(out))
+
+
+MUSIC_ENABLED = os.getenv("EPOXY_MUSIC_ENABLED", "0").strip() == "1"
+MUSIC_RISK_ACK = os.getenv("EPOXY_MUSIC_RISK_ACK", "").strip()
+MUSIC_TEXT_CHANNEL_ID = _env_int("EPOXY_MUSIC_TEXT_CHANNEL_ID", 0)
+MUSIC_VOICE_CHANNEL_ID = _env_int("EPOXY_MUSIC_VOICE_CHANNEL_ID", 0)
+MUSIC_OPERATOR_USER_IDS = parse_id_set(os.getenv("EPOXY_MUSIC_OPERATOR_USER_IDS"))
+if not MUSIC_OPERATOR_USER_IDS:
+    MUSIC_OPERATOR_USER_IDS = set(OWNER_USER_IDS)
+MUSIC_QUEUE_MAX = _env_int("EPOXY_MUSIC_QUEUE_MAX", 25)
+MUSIC_MAX_PER_USER = _env_int("EPOXY_MUSIC_MAX_PER_USER", 3)
+MUSIC_QUEUE_COOLDOWN_SECONDS = _env_int("EPOXY_MUSIC_QUEUE_COOLDOWN_SECONDS", 30)
+MUSIC_IDLE_DISCONNECT_SECONDS = _env_int("EPOXY_MUSIC_IDLE_DISCONNECT_SECONDS", 600)
+MUSIC_YT_MIN_SCORE = _env_int("EPOXY_MUSIC_YT_MIN_SCORE", 2)
+MUSIC_YT_ALLOW_KEYWORDS = _env_keywords(
+    "EPOXY_MUSIC_YT_ALLOW_KEYWORDS",
+    "lofi,lo-fi,chillhop,smooth jazz,nu jazz,jazzhop,study beats",
+)
+MUSIC_YT_DENY_KEYWORDS = _env_keywords(
+    "EPOXY_MUSIC_YT_DENY_KEYWORDS",
+    "phonk,hardstyle,dubstep,drill,trap,nightcore,bass boosted",
+)
+MUSIC_MIN_DURATION_SECONDS = _env_int("EPOXY_MUSIC_MIN_DURATION_SECONDS", 90)
+MUSIC_MAX_DURATION_SECONDS = _env_int("EPOXY_MUSIC_MAX_DURATION_SECONDS", 7200)
+MUSIC_DRY_RUN = os.getenv("EPOXY_MUSIC_DRY_RUN", "0").strip() == "1"
+if MUSIC_TEXT_CHANNEL_ID > 0:
+    ALLOWED_CHANNEL_IDS.add(int(MUSIC_TEXT_CHANNEL_ID))
+
+print(
+    f"[CFG] music_enabled={MUSIC_ENABLED} dry_run={MUSIC_DRY_RUN} "
+    f"text_channel={MUSIC_TEXT_CHANNEL_ID} voice_channel={MUSIC_VOICE_CHANNEL_ID} "
+    f"operators={len(MUSIC_OPERATOR_USER_IDS)} queue_max={MUSIC_QUEUE_MAX} "
+    f"per_user={MUSIC_MAX_PER_USER} cooldown_s={MUSIC_QUEUE_COOLDOWN_SECONDS} "
+    f"allowed_channels={len(ALLOWED_CHANNEL_IDS)}"
+)
 
 # =========================
 # "Seed memories" (Epoxy context pack)
@@ -1211,6 +1271,24 @@ announcement_service = AnnouncementService(
     dry_run=ANNOUNCE_DRY_RUN,
 )
 
+music_service = MusicService(
+    enabled=MUSIC_ENABLED,
+    risk_ack=MUSIC_RISK_ACK,
+    text_channel_id=MUSIC_TEXT_CHANNEL_ID,
+    voice_channel_id=MUSIC_VOICE_CHANNEL_ID,
+    operator_user_ids=MUSIC_OPERATOR_USER_IDS,
+    queue_max=MUSIC_QUEUE_MAX,
+    max_per_user=MUSIC_MAX_PER_USER,
+    queue_cooldown_seconds=MUSIC_QUEUE_COOLDOWN_SECONDS,
+    idle_disconnect_seconds=MUSIC_IDLE_DISCONNECT_SECONDS,
+    yt_min_score=MUSIC_YT_MIN_SCORE,
+    yt_allow_keywords=MUSIC_YT_ALLOW_KEYWORDS,
+    yt_deny_keywords=MUSIC_YT_DENY_KEYWORDS,
+    min_duration_seconds=MUSIC_MIN_DURATION_SECONDS,
+    max_duration_seconds=MUSIC_MAX_DURATION_SECONDS,
+    dry_run=MUSIC_DRY_RUN,
+)
+
 async def announcement_loop() -> None:
     return await announcement_loop_service(
         bot=bot,
@@ -1314,6 +1392,7 @@ wire_bot_runtime(
     announcement_enabled=ANNOUNCE_ENABLED,
     announcement_service=announcement_service,
     announcement_loop_func=announcement_loop,
+    music_service=music_service,
 )
 
 

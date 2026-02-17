@@ -6,6 +6,7 @@ import re
 
 from discord.ext import commands
 from memory.lifecycle_service import MemoryLifecycleError
+from memory.tagging import normalize_memory_tags
 from misc.commands.command_deps import CommandDeps
 from misc.commands.command_deps import CommandGates
 
@@ -384,7 +385,8 @@ def register(
             await ctx.send("`force_active=1` is owner-only.")
             return
 
-        tags = deps.normalize_tags(tags)
+        base_tags = deps.normalize_tags(tags) if deps.normalize_tags is not None else list(tags)
+        tags = normalize_memory_tags(base_tags, preserve_legacy=True)
         saved = await deps.remember_event_func(
             text=text,
             tags=tags,
@@ -502,7 +504,10 @@ def register(
                 origin=person_origin,
                 label="discord_user_id",
             )
-        tags = [deps.subject_person_tag(int(person_id)), deps.subject_user_tag(user_id), "profile"]
+        tags = normalize_memory_tags(
+            [deps.subject_person_tag(int(person_id)), deps.subject_user_tag(user_id), "profile"],
+            preserve_legacy=True,
+        )
         res = await deps.remember_event_func(
             text=text,
             tags=tags,

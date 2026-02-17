@@ -4,6 +4,8 @@ import asyncio
 import re
 from typing import Any
 
+from memory.tagging import normalize_memory_tags
+
 
 async def log_message(
     message: Any,
@@ -52,9 +54,9 @@ async def maybe_auto_capture(
         kind = m.group(1).lower()
         topic = (m.group(3) or "").strip()
         text = (m.group(4) or "").strip()
-        tags = [kind]
+        tags = normalize_memory_tags([kind], preserve_legacy=True)
         if topic:
-            tags = [topic] + tags
+            tags = normalize_memory_tags([topic] + tags, preserve_legacy=True)
         await remember_event_func(
             text=text,
             tags=tags,
@@ -71,7 +73,7 @@ async def maybe_auto_capture(
         text = (m2.group(2) or "").strip()
         await remember_event_func(
             text=text,
-            tags=[topic],
+            tags=normalize_memory_tags([topic], preserve_legacy=True),
             importance=1,
             message=message,
             topic_hint=topic,

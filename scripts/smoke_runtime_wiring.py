@@ -41,6 +41,51 @@ class _DummyAnnouncementService:
         return None
 
 
+class _DummyMusicService:
+    def disabled_reason(self):
+        return None
+
+    def in_music_text_channel(self, channel_id: int):
+        return int(channel_id) == 123456789012345678
+
+    def is_operator(self, user_id: int):
+        return True
+
+    async def start(self, **kwargs):
+        return (True, "ok")
+
+    async def stop(self, **kwargs):
+        return (True, "ok")
+
+    async def skip(self, **kwargs):
+        return (True, "ok")
+
+    async def pause(self, **kwargs):
+        return (True, "ok")
+
+    async def resume(self, **kwargs):
+        return (True, "ok")
+
+    async def clear_queue(self, **kwargs):
+        return (True, "ok")
+
+    async def queue_youtube(self, **kwargs):
+        return (True, "ok")
+
+    async def queue_list_text(self, **kwargs):
+        return "ok"
+
+    async def now_text(self):
+        return "ok"
+
+    async def status_text(self):
+        return "ok"
+
+    @property
+    def text_channel_id(self):
+        return 123456789012345678
+
+
 async def _remember_event(*args, **kwargs):
     return {"id": 1}
 
@@ -184,6 +229,7 @@ def _main() -> int:
         announcement_enabled=True,
         announcement_service=_DummyAnnouncementService(),
         announcement_loop_func=_noop_async,
+        music_service=_DummyMusicService(),
     )
 
     expected_commands = {
@@ -219,6 +265,17 @@ def _main() -> int:
         "topicsuggest",
         "setup_welcome_panel",
         "lfg",
+        "music.start",
+        "music.stop",
+        "music.skip",
+        "music.pause",
+        "music.resume",
+        "music.clearqueue",
+        "music.forcequeue",
+        "music.queue",
+        "music.queue_list",
+        "music.now",
+        "music.status",
     }
     existing_commands = set(bot.all_commands.keys())
     missing = sorted(expected_commands - existing_commands)

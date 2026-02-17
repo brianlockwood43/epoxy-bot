@@ -49,10 +49,12 @@ This document reflects the current post-refactor layout of the bot runtime.
     - `commands_mining.py`: mining/context/topic suggestion commands.
     - `commands_community.py`: community ops commands (welcome panel, `!lfg`).
     - `commands_announcements.py`: announcement automation commands (`!announce.*`).
+    - `commands_music.py`: constrained calm/chill music commands (`!music.*`).
     - each module exposes `register(bot, *, deps: CommandDeps, gates: CommandGates)`.
   - `adhoc_modules/`
     - `announcements_service.py`: announcement template loading, draft generation, scheduler logic.
     - `announcements_store.py`: persistence helpers for announcement cycles/answers/audit logs.
+    - `music_service.py`: constrained YouTube metadata/queue/voice playback orchestration.
     - `welcome_panel.py`: welcome panel view + role lookup helper.
 
 - `db/`

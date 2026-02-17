@@ -2,3 +2,5 @@ discord.py
 openai>=1.0.0
 python-dotenv
 PyYAML
+PyNaCl
+yt-dlp
