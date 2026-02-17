@@ -280,13 +280,41 @@ class MusicService:
             return (False, f"Queue rejected: {meta_err or 'metadata check failed'}")
 
         heuristic = self.evaluate_metadata_heuristic(metadata)
+        expected_score = len(list(heuristic.get("allow_hits", []))) - (2 * len(list(heuristic.get("deny_hits", []))))
+        score_value = int(heuristic.get("score", expected_score))
+        if score_value != expected_score:
+            print(
+                f"[MUSIC] action=heuristic_score_mismatch "
+                f"reported={score_value} expected={expected_score} "
+                f"video_id={video_id}"
+            )
+            score_value = expected_score
         if not force and not heuristic["passes"]:
+            reason_bits: list[str] = []
+            if score_value < self.yt_min_score:
+                reason_bits.append(f"score<{self.yt_min_score}")
+            if len(list(heuristic.get("deny_hits", []))) > 0:
+                reason_bits.append("deny_hits>0")
+            if not bool(heuristic.get("duration_ok", False)):
+                reason_bits.append(
+                    f"duration_outside_{self.min_duration_seconds}-{self.max_duration_seconds}s"
+                )
+            if not (
+                bool(heuristic.get("category_music", False))
+                or score_value >= (self.yt_min_score + 1)
+            ):
+                reason_bits.append("category_not_music_and_score_below_bonus_threshold")
+            if not reason_bits:
+                reason_bits.append("unknown")
             return (
                 False,
                 (
                     "Queue rejected: metadata did not pass calm-genre heuristic "
-                    f"(score={heuristic['score']}, allow_hits={len(heuristic['allow_hits'])}, "
-                    f"deny_hits={len(heuristic['deny_hits'])})."
+                    f"(score={score_value}, allow_hits={len(heuristic['allow_hits'])}, "
+                    f"deny_hits={len(heuristic['deny_hits'])}, "
+                    f"duration_ok={bool(heuristic.get('duration_ok', False))}, "
+                    f"category_music={bool(heuristic.get('category_music', False))}, "
+                    f"reasons={','.join(reason_bits)})."
                 ),
             )
 
@@ -301,7 +329,7 @@ class MusicService:
             duration_seconds=duration_seconds,
             submitted_by_user_id=user_id,
             submitted_at_utc=self._utc_iso(),
-            score=int(heuristic["score"]),
+            score=score_value,
             allow_hits=list(heuristic["allow_hits"]),
             deny_hits=list(heuristic["deny_hits"]),
             category_music=bool(heuristic["category_music"]),
