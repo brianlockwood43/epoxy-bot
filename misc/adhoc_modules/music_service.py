@@ -79,6 +79,8 @@ class MusicService:
         self.voice_client: discord.VoiceClient | None = None
         self.connected_guild_id: int | None = None
         self.last_queue_at_by_user: dict[int, float] = {}
+        self.pending_intake_count: int = 0
+        self.last_playback_error: str | None = None
 
         self._idle_disconnect_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
@@ -275,90 +277,104 @@ class MusicService:
                 if wait_left > 0:
                     return (False, f"Queue rejected: wait {wait_left}s before queueing again.")
 
-        ok_meta, metadata, meta_err = await self.fetch_video_metadata(canonical_url)
-        if not ok_meta or metadata is None:
-            return (False, f"Queue rejected: {meta_err or 'metadata check failed'}")
-
-        heuristic = self.evaluate_metadata_heuristic(metadata)
-        expected_score = len(list(heuristic.get("allow_hits", []))) - (2 * len(list(heuristic.get("deny_hits", []))))
-        score_value = int(heuristic.get("score", expected_score))
-        if score_value != expected_score:
-            print(
-                f"[MUSIC] action=heuristic_score_mismatch "
-                f"reported={score_value} expected={expected_score} "
-                f"video_id={video_id}"
-            )
-            score_value = expected_score
-        if not force and not heuristic["passes"]:
-            reason_bits: list[str] = []
-            if score_value < self.yt_min_score:
-                reason_bits.append(f"score<{self.yt_min_score}")
-            if len(list(heuristic.get("deny_hits", []))) > 0:
-                reason_bits.append("deny_hits>0")
-            if not bool(heuristic.get("duration_ok", False)):
-                reason_bits.append(
-                    f"duration_outside_{self.min_duration_seconds}-{self.max_duration_seconds}s"
-                )
-            if not (
-                bool(heuristic.get("category_music", False))
-                or score_value >= (self.yt_min_score + 1)
-            ):
-                reason_bits.append("category_not_music_and_score_below_bonus_threshold")
-            if not reason_bits:
-                reason_bits.append("unknown")
-            return (
-                False,
-                (
-                    "Queue rejected: metadata did not pass calm-genre heuristic "
-                    f"(score={score_value}, allow_hits={len(heuristic['allow_hits'])}, "
-                    f"deny_hits={len(heuristic['deny_hits'])}, "
-                    f"duration_ok={bool(heuristic.get('duration_ok', False))}, "
-                    f"category_music={bool(heuristic.get('category_music', False))}, "
-                    f"reasons={','.join(reason_bits)})."
-                ),
-            )
-
-        duration_seconds = int(heuristic.get("duration_seconds") or 0)
-        title = str(metadata.get("title") or "Unknown title").strip() or "Unknown title"
-        uploader = str(metadata.get("uploader") or metadata.get("channel") or "Unknown uploader").strip() or "Unknown uploader"
-        item = MusicQueueItem(
-            video_id=video_id,
-            canonical_url=canonical_url,
-            title=title,
-            uploader=uploader,
-            duration_seconds=duration_seconds,
-            submitted_by_user_id=user_id,
-            submitted_at_utc=self._utc_iso(),
-            score=score_value,
-            allow_hits=list(heuristic["allow_hits"]),
-            deny_hits=list(heuristic["deny_hits"]),
-            category_music=bool(heuristic["category_music"]),
-            forced=bool(force),
-        )
-
-        should_kick_playback = False
         async with self._lock:
-            for existing in self.queue:
-                if existing.video_id == video_id:
-                    return (False, "Queue rejected: this video is already in the queue.")
-            if len(self.queue) >= self.queue_max:
-                return (False, f"Queue rejected: queue is full ({self.queue_max} max).")
-            self.queue.append(item)
-            self.last_queue_at_by_user[user_id] = now_monotonic
-            vc = self.voice_client
-            should_kick_playback = bool(
-                vc is not None and vc.is_connected() and (not vc.is_playing()) and (not vc.is_paused()) and self.current_item is None
-            )
-            if should_kick_playback:
-                self._cancel_idle_disconnect_task_locked()
+            self.pending_intake_count += 1
 
-        print(f"[MUSIC] action=queue result=ok user={user_id} video_id={video_id} score={item.score} forced={item.forced}")
-        if should_kick_playback and not self.dry_run:
-            await self._play_next()
-        return (
-            True,
-            f"Queued: {item.title} (score={item.score}, by={item.uploader}). Position: {len(self.queue)}.",
-        )
+        try:
+            ok_meta, metadata, meta_err = await self.fetch_video_metadata(canonical_url)
+            if not ok_meta or metadata is None:
+                return (False, f"Queue rejected: {meta_err or 'metadata check failed'}")
+
+            heuristic = self.evaluate_metadata_heuristic(metadata)
+            expected_score = len(list(heuristic.get("allow_hits", []))) - (2 * len(list(heuristic.get("deny_hits", []))))
+            score_value = int(heuristic.get("score", expected_score))
+            if score_value != expected_score:
+                print(
+                    f"[MUSIC] action=heuristic_score_mismatch "
+                    f"reported={score_value} expected={expected_score} "
+                    f"video_id={video_id}"
+                )
+                score_value = expected_score
+            if not force and not heuristic["passes"]:
+                reason_bits: list[str] = []
+                if score_value < self.yt_min_score:
+                    reason_bits.append(f"score<{self.yt_min_score}")
+                if len(list(heuristic.get("deny_hits", []))) > 0:
+                    reason_bits.append("deny_hits>0")
+                if not bool(heuristic.get("duration_ok", False)):
+                    reason_bits.append(
+                        f"duration_outside_{self.min_duration_seconds}-{self.max_duration_seconds}s"
+                    )
+                if not (
+                    bool(heuristic.get("category_music", False))
+                    or score_value >= (self.yt_min_score + 1)
+                ):
+                    reason_bits.append("category_not_music_and_score_below_bonus_threshold")
+                if not reason_bits:
+                    reason_bits.append("unknown")
+                return (
+                    False,
+                    (
+                        "Queue rejected: metadata did not pass calm-genre heuristic "
+                        f"(score={score_value}, allow_hits={len(heuristic['allow_hits'])}, "
+                        f"deny_hits={len(heuristic['deny_hits'])}, "
+                        f"duration_ok={bool(heuristic.get('duration_ok', False))}, "
+                        f"category_music={bool(heuristic.get('category_music', False))}, "
+                        f"reasons={','.join(reason_bits)})."
+                    ),
+                )
+
+            duration_seconds = int(heuristic.get("duration_seconds") or 0)
+            title = str(metadata.get("title") or "Unknown title").strip() or "Unknown title"
+            uploader = str(metadata.get("uploader") or metadata.get("channel") or "Unknown uploader").strip() or "Unknown uploader"
+            item = MusicQueueItem(
+                video_id=video_id,
+                canonical_url=canonical_url,
+                title=title,
+                uploader=uploader,
+                duration_seconds=duration_seconds,
+                submitted_by_user_id=user_id,
+                submitted_at_utc=self._utc_iso(),
+                score=score_value,
+                allow_hits=list(heuristic["allow_hits"]),
+                deny_hits=list(heuristic["deny_hits"]),
+                category_music=bool(heuristic["category_music"]),
+                forced=bool(force),
+            )
+
+            should_kick_playback = False
+            has_connected_voice = False
+            queue_position = 0
+            async with self._lock:
+                for existing in self.queue:
+                    if existing.video_id == video_id:
+                        return (False, "Queue rejected: this video is already in the queue.")
+                if len(self.queue) >= self.queue_max:
+                    return (False, f"Queue rejected: queue is full ({self.queue_max} max).")
+                self.queue.append(item)
+                queue_position = len(self.queue)
+                self.last_queue_at_by_user[user_id] = now_monotonic
+                vc = self.voice_client
+                has_connected_voice = bool(vc is not None and vc.is_connected())
+                should_kick_playback = bool(
+                    vc is not None and vc.is_connected() and (not vc.is_playing()) and (not vc.is_paused()) and self.current_item is None
+                )
+                if should_kick_playback:
+                    self._cancel_idle_disconnect_task_locked()
+
+            print(f"[MUSIC] action=queue result=ok user={user_id} video_id={video_id} score={item.score} forced={item.forced}")
+            if should_kick_playback and not self.dry_run:
+                await self._play_next()
+            suffix = ""
+            if not has_connected_voice:
+                suffix = " Epoxy is not in voice yet. Operator: run `!music.start`."
+            return (
+                True,
+                f"Queued: {item.title} (score={item.score}, by={item.uploader}). Position: {queue_position}.{suffix}",
+            )
+        finally:
+            async with self._lock:
+                self.pending_intake_count = max(0, int(self.pending_intake_count) - 1)
 
     async def start(self, *, bot, guild: discord.Guild, actor_user_id: int) -> tuple[bool, str]:
         reason = self.disabled_reason()
@@ -409,11 +425,27 @@ class MusicService:
 
         print(f"[MUSIC] action=start result=ok user={actor_user_id} guild={int(guild.id)}")
         await self._play_next()
+        # Queue intake can still be in-flight while start is called; give it a short window.
+        for _ in range(20):
+            async with self._lock:
+                pending = int(self.pending_intake_count)
+                has_current = self.current_item is not None
+                queued_n = len(self.queue)
+            if has_current or queued_n > 0 or pending <= 0:
+                break
+            await asyncio.sleep(0.25)
+            await self._play_next()
         async with self._lock:
             current_title = self.current_item.title if self.current_item is not None else None
             queued_n = len(self.queue)
+            pending_n = int(self.pending_intake_count)
+            last_error = self.last_playback_error
         if current_title:
             return (True, f"Music started. Now playing: {current_title} (queue={queued_n}).")
+        if pending_n > 0:
+            return (True, f"Music started. Queue intake in progress ({pending_n}); run `!music.now` in a moment.")
+        if last_error:
+            return (True, f"Music started, but playback failed: {last_error}")
         return (True, "Music started. Queue is empty.")
 
     async def stop(self, *, actor_user_id: int) -> tuple[bool, str]:
@@ -553,6 +585,8 @@ class MusicService:
             f"- paused: {'yes' if is_paused else 'no'}\n"
             f"- now: {current_title}\n"
             f"- queue_len: {q_len}\n"
+            f"- queue_intake_inflight: {self.pending_intake_count}\n"
+            f"- last_playback_error: {self.last_playback_error or '(none)'}\n"
             f"- queue_limits: total={self.queue_max}, per_user={self.max_per_user}, cooldown_s={self.queue_cooldown_seconds}"
         )
 
@@ -575,6 +609,7 @@ class MusicService:
 
             ok, stream_url, err = await self.resolve_stream_url(item.canonical_url)
             if not ok or not stream_url:
+                self.last_playback_error = str(err or "stream URL resolution failed")[:220]
                 print(
                     f"[MUSIC] action=play_next result=resolve_error "
                     f"video_id={item.video_id} error={err or 'unknown'}"
@@ -582,7 +617,9 @@ class MusicService:
                 async with self._lock:
                     if self.current_item is not None and self.current_item.video_id == item.video_id:
                         self.current_item = None
-                continue
+                    # Keep failed item at head so operators can retry after fixing runtime/env issues.
+                    self.queue.appendleft(item)
+                return
 
             try:
                 source = discord.FFmpegPCMAudio(
@@ -591,6 +628,7 @@ class MusicService:
                     options="-vn",
                 )
             except Exception as e:
+                self.last_playback_error = f"ffmpeg init failed: {str(e)[:180]}"
                 print(
                     f"[MUSIC] action=play_next result=ffmpeg_error "
                     f"video_id={item.video_id} error={str(e)[:180]}"
@@ -598,7 +636,8 @@ class MusicService:
                 async with self._lock:
                     if self.current_item is not None and self.current_item.video_id == item.video_id:
                         self.current_item = None
-                continue
+                    self.queue.appendleft(item)
+                return
 
             loop = self._loop
             if loop is None:
@@ -613,6 +652,7 @@ class MusicService:
             try:
                 vc.play(source, after=_after_playback)
             except Exception as e:
+                self.last_playback_error = f"voice play failed: {str(e)[:180]}"
                 print(
                     f"[MUSIC] action=play_next result=voice_play_error "
                     f"video_id={item.video_id} error={str(e)[:180]}"
@@ -620,9 +660,11 @@ class MusicService:
                 async with self._lock:
                     if self.current_item is not None and self.current_item.video_id == item.video_id:
                         self.current_item = None
-                continue
+                    self.queue.appendleft(item)
+                return
 
             print(f"[MUSIC] action=play_next result=ok video_id={item.video_id} title={item.title[:80]}")
+            self.last_playback_error = None
             return
 
     async def _on_track_finished(self, video_id: str, error: Exception | None) -> None:
