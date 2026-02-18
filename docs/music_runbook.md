@@ -20,6 +20,8 @@ Recommended initial rollout:
 
 - Install Python deps: `yt-dlp`, `PyNaCl`
 - Ensure FFmpeg is available in runtime image/path
+- Railway/Nixpacks default path: include repo `nixpacks.toml` with `ffmpeg` in setup packages
+  - Alternative: set Railway build env `NIXPACKS_PKGS=ffmpeg`
 
 If FFmpeg is missing, voice playback commands fail at runtime.
 
