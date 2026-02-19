@@ -46,6 +46,7 @@ class MusicService:
         risk_ack: str,
         text_channel_id: int,
         voice_channel_id: int,
+        voice_channel_aliases: dict[str, int] | None = None,
         operator_user_ids: set[int],
         queue_max: int,
         max_per_user: int,
@@ -56,12 +57,17 @@ class MusicService:
         yt_deny_keywords: list[str],
         min_duration_seconds: int,
         max_duration_seconds: int,
+        playlist_max_items: int,
         dry_run: bool,
     ) -> None:
         self.enabled_flag = bool(enabled)
         self.risk_ack = str(risk_ack or "").strip()
         self.text_channel_id = int(text_channel_id or 0)
         self.voice_channel_id = int(voice_channel_id or 0)
+        self.voice_channel_aliases = self._build_voice_channel_aliases(
+            default_voice_channel_id=self.voice_channel_id,
+            aliases=voice_channel_aliases or {},
+        )
         self.operator_user_ids = {int(uid) for uid in (operator_user_ids or set()) if int(uid) > 0}
         self.queue_max = max(1, int(queue_max or 25))
         self.max_per_user = max(1, int(max_per_user or 3))
@@ -72,11 +78,14 @@ class MusicService:
         self.yt_deny_keywords = [str(x).strip().lower() for x in (yt_deny_keywords or []) if str(x).strip()]
         self.min_duration_seconds = max(0, int(min_duration_seconds or 90))
         self.max_duration_seconds = max(self.min_duration_seconds, int(max_duration_seconds or 7200))
+        self.playlist_max_items = max(1, int(playlist_max_items or 10))
         self.dry_run = bool(dry_run)
 
         self.queue: deque[MusicQueueItem] = deque()
         self.current_item: MusicQueueItem | None = None
         self.voice_client: discord.VoiceClient | None = None
+        self.active_voice_channel_id: int | None = None
+        self.active_voice_target: str | None = None
         self.connected_guild_id: int | None = None
         self.last_queue_at_by_user: dict[int, float] = {}
         self.pending_intake_count: int = 0
@@ -91,11 +100,49 @@ class MusicService:
             return "music feature flag is off"
         if self.risk_ack != RISK_ACK_VALUE:
             return "risk acknowledgment missing"
-        if self.text_channel_id <= 0 or self.voice_channel_id <= 0:
+        if self.text_channel_id <= 0 or not self.voice_channel_aliases:
             return "music channel IDs are not configured"
         if yt_dlp is None:
             return "yt-dlp is not installed"
         return None
+
+    @staticmethod
+    def _normalize_voice_alias(raw: str) -> str:
+        return re.sub(r"[\s_-]+", "", str(raw or "").strip().lower())
+
+    @classmethod
+    def _build_voice_channel_aliases(
+        cls,
+        *,
+        default_voice_channel_id: int,
+        aliases: dict[str, int],
+    ) -> dict[str, int]:
+        out: dict[str, int] = {}
+        if int(default_voice_channel_id or 0) > 0:
+            out["calm"] = int(default_voice_channel_id)
+        for key, value in (aliases or {}).items():
+            alias = cls._normalize_voice_alias(str(key or ""))
+            channel_id = int(value or 0)
+            if alias and channel_id > 0:
+                out[alias] = channel_id
+        return out
+
+    def resolve_voice_target(self, selection: str | None) -> tuple[bool, str | None, int | None, str | None]:
+        if not self.voice_channel_aliases:
+            return (False, None, None, "no music voice channels are configured")
+
+        normalized = self._normalize_voice_alias(str(selection or ""))
+        if not normalized:
+            if "calm" in self.voice_channel_aliases:
+                return (True, "calm", int(self.voice_channel_aliases["calm"]), None)
+            fallback = sorted(self.voice_channel_aliases.items())[0]
+            return (True, str(fallback[0]), int(fallback[1]), None)
+
+        channel_id = self.voice_channel_aliases.get(normalized)
+        if channel_id is None:
+            choices = ", ".join(sorted(self.voice_channel_aliases.keys()))
+            return (False, None, None, f"unknown voice target '{selection}'. Options: {choices}")
+        return (True, normalized, int(channel_id), None)
 
     def is_operator(self, user_id: int) -> bool:
         return int(user_id) in self.operator_user_ids
@@ -140,6 +187,96 @@ class MusicService:
 
         canonical = f"https://www.youtube.com/watch?v={video_id}"
         return (True, canonical, video_id, None)
+
+    def parse_youtube_intake(self, raw_url: str) -> tuple[bool, dict[str, Any] | None, str | None]:
+        text = str(raw_url or "").strip()
+        if not text:
+            return (False, None, "missing URL")
+        parsed = urlparse(text)
+        if parsed.scheme not in {"http", "https"}:
+            return (False, None, "URL must start with http:// or https://")
+
+        host = (parsed.netloc or "").lower()
+        path = parsed.path or ""
+        query = parse_qs(parsed.query or "")
+        playlist_id = str((query.get("list") or [""])[0] or "").strip()
+
+        if "youtu.be" in host:
+            token = path.strip("/").split("/", 1)[0]
+            if playlist_id:
+                if not token or not YOUTUBE_ID_RE.fullmatch(token):
+                    return (False, None, "could not parse a valid YouTube video id")
+                return (
+                    True,
+                    {
+                        "kind": "playlist",
+                        "playlist_id": playlist_id,
+                        "playlist_url": f"https://www.youtube.com/watch?v={token}&list={playlist_id}",
+                        "seed_video_id": token,
+                    },
+                    None,
+                )
+            if not token or not YOUTUBE_ID_RE.fullmatch(token):
+                return (False, None, "could not parse a valid YouTube video id")
+            return (
+                True,
+                {
+                    "kind": "video",
+                    "video_id": token,
+                    "canonical_url": f"https://www.youtube.com/watch?v={token}",
+                },
+                None,
+            )
+
+        if "youtube.com" not in host:
+            return (False, None, "URL must be a youtube.com or youtu.be link")
+
+        if path == "/playlist":
+            if not playlist_id:
+                return (False, None, "playlist URL is missing list id")
+            return (
+                True,
+                {
+                    "kind": "playlist",
+                    "playlist_id": playlist_id,
+                    "playlist_url": f"https://www.youtube.com/playlist?list={playlist_id}",
+                },
+                None,
+            )
+
+        if path == "/watch":
+            video_id = str((query.get("v") or [""])[0] or "").strip()
+            if playlist_id:
+                if video_id and not YOUTUBE_ID_RE.fullmatch(video_id):
+                    return (False, None, "could not parse a valid YouTube video id")
+                playlist_url = (
+                    f"https://www.youtube.com/watch?v={video_id}&list={playlist_id}"
+                    if video_id
+                    else f"https://www.youtube.com/playlist?list={playlist_id}"
+                )
+                return (
+                    True,
+                    {
+                        "kind": "playlist",
+                        "playlist_id": playlist_id,
+                        "playlist_url": playlist_url,
+                        "seed_video_id": video_id or None,
+                    },
+                    None,
+                )
+            if not video_id or not YOUTUBE_ID_RE.fullmatch(video_id):
+                return (False, None, "could not parse a valid YouTube video id")
+            return (
+                True,
+                {
+                    "kind": "video",
+                    "video_id": video_id,
+                    "canonical_url": f"https://www.youtube.com/watch?v={video_id}",
+                },
+                None,
+            )
+
+        return (False, None, "unsupported YouTube URL format")
 
     def evaluate_metadata_heuristic(self, metadata: dict[str, Any]) -> dict[str, Any]:
         title = str(metadata.get("title") or "")
@@ -234,6 +371,48 @@ class MusicService:
             return (False, None, "no playable audio stream URL found")
         return (True, url, None)
 
+    async def fetch_playlist_video_ids(
+        self,
+        playlist_url: str,
+        *,
+        max_items: int,
+    ) -> tuple[bool, list[str] | None, str | None, str | None]:
+        try:
+            info = await asyncio.to_thread(self._extract_playlist_info_sync, playlist_url, max_items)
+        except Exception as e:
+            return (False, None, None, f"playlist lookup failed: {str(e)[:160]}")
+
+        if not isinstance(info, dict):
+            return (False, None, None, "extractor returned invalid playlist response")
+
+        playlist_title = str(info.get("title") or "").strip() or "YouTube playlist"
+        entries = info.get("entries")
+        if not isinstance(entries, list) or not entries:
+            return (False, None, playlist_title, "playlist has no playable entries")
+
+        seen: set[str] = set()
+        out: list[str] = []
+        for row in entries:
+            if len(out) >= max_items:
+                break
+            if not isinstance(row, dict):
+                continue
+            video_id = str(row.get("id") or "").strip()
+            if not video_id:
+                url_field = str(row.get("url") or "").strip()
+                if YOUTUBE_ID_RE.fullmatch(url_field):
+                    video_id = url_field
+            if not video_id or not YOUTUBE_ID_RE.fullmatch(video_id):
+                continue
+            if video_id in seen:
+                continue
+            seen.add(video_id)
+            out.append(video_id)
+
+        if not out:
+            return (False, None, playlist_title, "playlist has no valid YouTube video entries")
+        return (True, out, playlist_title, None)
+
     def _extract_video_info_sync(self, canonical_url: str, metadata_only: bool) -> dict[str, Any]:
         if yt_dlp is None:
             raise RuntimeError("yt-dlp dependency missing")
@@ -251,155 +430,288 @@ class MusicService:
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(canonical_url, download=False)
 
+    def _extract_playlist_info_sync(self, playlist_url: str, max_items: int) -> dict[str, Any]:
+        if yt_dlp is None:
+            raise RuntimeError("yt-dlp dependency missing")
+        safe_max = max(1, int(max_items or 1))
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": False,
+            "skip_download": True,
+            "extract_flat": "in_playlist",
+            "playlistend": safe_max,
+            "nocheckcertificate": True,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(playlist_url, download=False)
+
     async def queue_youtube(self, *, raw_url: str, submitted_by_user_id: int, force: bool = False) -> tuple[bool, str]:
         reason = self.disabled_reason()
         if reason:
             return (False, f"Music is disabled: {reason}.")
 
-        ok, canonical_url, video_id, err = self.normalize_youtube_url(raw_url)
-        if not ok or not canonical_url or not video_id:
-            return (False, f"Queue rejected: {err or 'invalid URL'}")
+        ok_input, intake, err_input = self.parse_youtube_intake(raw_url)
+        if not ok_input or not isinstance(intake, dict):
+            return (False, f"Queue rejected: {err_input or 'invalid URL'}")
+
+        source_kind = str(intake.get("kind") or "")
+        playlist_title = ""
+        candidate_video_ids: list[str] = []
+
+        if source_kind == "video":
+            video_id = str(intake.get("video_id") or "").strip()
+            if not video_id or not YOUTUBE_ID_RE.fullmatch(video_id):
+                return (False, "Queue rejected: invalid YouTube video id.")
+            candidate_video_ids = [video_id]
+        elif source_kind == "playlist":
+            playlist_url = str(intake.get("playlist_url") or "").strip()
+            if not playlist_url:
+                return (False, "Queue rejected: invalid playlist URL.")
+            ok_list, list_ids, title, list_err = await self.fetch_playlist_video_ids(
+                playlist_url,
+                max_items=self.playlist_max_items,
+            )
+            if not ok_list or not list_ids:
+                return (False, f"Queue rejected: {list_err or 'playlist lookup failed'}")
+            candidate_video_ids = list(list_ids)
+            playlist_title = str(title or "").strip()
+        else:
+            return (False, "Queue rejected: unsupported YouTube URL type.")
 
         user_id = int(submitted_by_user_id)
         now_monotonic = time.monotonic()
+
         async with self._lock:
-            for item in self.queue:
-                if item.video_id == video_id:
-                    return (False, "Queue rejected: this video is already in the queue.")
-            if len(self.queue) >= self.queue_max:
-                return (False, f"Queue rejected: queue is full ({self.queue_max} max).")
             if not force:
-                user_pending = sum(1 for item in self.queue if item.submitted_by_user_id == user_id)
-                if user_pending >= self.max_per_user:
-                    return (False, f"Queue rejected: per-user queue limit is {self.max_per_user}.")
                 last_ts = float(self.last_queue_at_by_user.get(user_id, 0.0))
                 wait_left = int((last_ts + self.queue_cooldown_seconds) - now_monotonic)
                 if wait_left > 0:
                     return (False, f"Queue rejected: wait {wait_left}s before queueing again.")
+            if source_kind == "video":
+                if any(item.video_id == candidate_video_ids[0] for item in self.queue):
+                    return (False, "Queue rejected: this video is already in the queue.")
+                if len(self.queue) >= self.queue_max:
+                    return (False, f"Queue rejected: queue is full ({self.queue_max} max).")
+                if not force:
+                    user_pending = sum(1 for item in self.queue if item.submitted_by_user_id == user_id)
+                    if user_pending >= self.max_per_user:
+                        return (False, f"Queue rejected: per-user queue limit is {self.max_per_user}.")
 
         async with self._lock:
             self.pending_intake_count += 1
 
         try:
-            ok_meta, metadata, meta_err = await self.fetch_video_metadata(canonical_url)
-            if not ok_meta or metadata is None:
-                return (False, f"Queue rejected: {meta_err or 'metadata check failed'}")
-
-            heuristic = self.evaluate_metadata_heuristic(metadata)
-            expected_score = len(list(heuristic.get("allow_hits", []))) - (2 * len(list(heuristic.get("deny_hits", []))))
-            score_value = int(heuristic.get("score", expected_score))
-            if score_value != expected_score:
-                print(
-                    f"[MUSIC] action=heuristic_score_mismatch "
-                    f"reported={score_value} expected={expected_score} "
-                    f"video_id={video_id}"
-                )
-                score_value = expected_score
-            if not force and not heuristic["passes"]:
-                reason_bits: list[str] = []
-                if score_value < self.yt_min_score:
-                    reason_bits.append(f"score<{self.yt_min_score}")
-                if len(list(heuristic.get("deny_hits", []))) > 0:
-                    reason_bits.append("deny_hits>0")
-                if not bool(heuristic.get("duration_ok", False)):
-                    reason_bits.append(
-                        f"duration_outside_{self.min_duration_seconds}-{self.max_duration_seconds}s"
-                    )
-                if not (
-                    bool(heuristic.get("category_music", False))
-                    or score_value >= (self.yt_min_score + 1)
-                ):
-                    reason_bits.append("category_not_music_and_score_below_bonus_threshold")
-                if not reason_bits:
-                    reason_bits.append("unknown")
-                return (
-                    False,
-                    (
-                        "Queue rejected: metadata did not pass calm-genre heuristic "
-                        f"(score={score_value}, allow_hits={len(heuristic['allow_hits'])}, "
-                        f"deny_hits={len(heuristic['deny_hits'])}, "
-                        f"duration_ok={bool(heuristic.get('duration_ok', False))}, "
-                        f"category_music={bool(heuristic.get('category_music', False))}, "
-                        f"reasons={','.join(reason_bits)})."
-                    ),
-                )
-
-            duration_seconds = int(heuristic.get("duration_seconds") or 0)
-            title = str(metadata.get("title") or "Unknown title").strip() or "Unknown title"
-            uploader = str(metadata.get("uploader") or metadata.get("channel") or "Unknown uploader").strip() or "Unknown uploader"
-            item = MusicQueueItem(
-                video_id=video_id,
-                canonical_url=canonical_url,
-                title=title,
-                uploader=uploader,
-                duration_seconds=duration_seconds,
-                submitted_by_user_id=user_id,
-                submitted_at_utc=self._utc_iso(),
-                score=score_value,
-                allow_hits=list(heuristic["allow_hits"]),
-                deny_hits=list(heuristic["deny_hits"]),
-                category_music=bool(heuristic["category_music"]),
-                forced=bool(force),
-            )
-
             should_kick_playback = False
             has_connected_voice = False
-            queue_position = 0
-            async with self._lock:
-                for existing in self.queue:
-                    if existing.video_id == video_id:
-                        return (False, "Queue rejected: this video is already in the queue.")
-                if len(self.queue) >= self.queue_max:
-                    return (False, f"Queue rejected: queue is full ({self.queue_max} max).")
-                self.queue.append(item)
-                queue_position = len(self.queue)
-                self.last_queue_at_by_user[user_id] = now_monotonic
-                vc = self.voice_client
-                has_connected_voice = bool(vc is not None and vc.is_connected())
-                should_kick_playback = bool(
-                    vc is not None and vc.is_connected() and (not vc.is_playing()) and (not vc.is_paused()) and self.current_item is None
-                )
-                if should_kick_playback:
-                    self._cancel_idle_disconnect_task_locked()
+            added_items: list[MusicQueueItem] = []
+            skipped_duplicate = 0
+            skipped_limit = 0
+            skipped_metadata = 0
+            rejection_sample = ""
+            seen_this_request: set[str] = set()
 
-            print(f"[MUSIC] action=queue result=ok user={user_id} video_id={video_id} score={item.score} forced={item.forced}")
+            for video_id in candidate_video_ids:
+                if video_id in seen_this_request:
+                    skipped_duplicate += 1
+                    continue
+                seen_this_request.add(video_id)
+                canonical_url = f"https://www.youtube.com/watch?v={video_id}"
+
+                async with self._lock:
+                    if any(item.video_id == video_id for item in self.queue):
+                        skipped_duplicate += 1
+                        continue
+                    if len(self.queue) >= self.queue_max:
+                        skipped_limit += 1
+                        continue
+                    if not force:
+                        user_pending_now = sum(1 for item in self.queue if item.submitted_by_user_id == user_id)
+                        if user_pending_now >= self.max_per_user:
+                            skipped_limit += 1
+                            continue
+
+                ok_meta, metadata, meta_err = await self.fetch_video_metadata(canonical_url)
+                if not ok_meta or metadata is None:
+                    skipped_metadata += 1
+                    if not rejection_sample:
+                        rejection_sample = str(meta_err or "metadata check failed")
+                    continue
+
+                heuristic = self.evaluate_metadata_heuristic(metadata)
+                expected_score = len(list(heuristic.get("allow_hits", []))) - (2 * len(list(heuristic.get("deny_hits", []))))
+                score_value = int(heuristic.get("score", expected_score))
+                if score_value != expected_score:
+                    print(
+                        f"[MUSIC] action=heuristic_score_mismatch "
+                        f"reported={score_value} expected={expected_score} "
+                        f"video_id={video_id}"
+                    )
+                    score_value = expected_score
+
+                if not force and not heuristic["passes"]:
+                    skipped_metadata += 1
+                    if not rejection_sample:
+                        reason_bits: list[str] = []
+                        if score_value < self.yt_min_score:
+                            reason_bits.append(f"score<{self.yt_min_score}")
+                        if len(list(heuristic.get("deny_hits", []))) > 0:
+                            reason_bits.append("deny_hits>0")
+                        if not bool(heuristic.get("duration_ok", False)):
+                            reason_bits.append(
+                                f"duration_outside_{self.min_duration_seconds}-{self.max_duration_seconds}s"
+                            )
+                        if not (
+                            bool(heuristic.get("category_music", False))
+                            or score_value >= (self.yt_min_score + 1)
+                        ):
+                            reason_bits.append("category_not_music_and_score_below_bonus_threshold")
+                        if not reason_bits:
+                            reason_bits.append("unknown")
+                        rejection_sample = (
+                            "metadata did not pass calm-genre heuristic "
+                            f"(score={score_value}, allow_hits={len(heuristic['allow_hits'])}, "
+                            f"deny_hits={len(heuristic['deny_hits'])}, "
+                            f"duration_ok={bool(heuristic.get('duration_ok', False))}, "
+                            f"category_music={bool(heuristic.get('category_music', False))}, "
+                            f"reasons={','.join(reason_bits)})."
+                        )
+                    continue
+
+                duration_seconds = int(heuristic.get("duration_seconds") or 0)
+                title = str(metadata.get("title") or "Unknown title").strip() or "Unknown title"
+                uploader = str(metadata.get("uploader") or metadata.get("channel") or "Unknown uploader").strip() or "Unknown uploader"
+                item = MusicQueueItem(
+                    video_id=video_id,
+                    canonical_url=canonical_url,
+                    title=title,
+                    uploader=uploader,
+                    duration_seconds=duration_seconds,
+                    submitted_by_user_id=user_id,
+                    submitted_at_utc=self._utc_iso(),
+                    score=score_value,
+                    allow_hits=list(heuristic["allow_hits"]),
+                    deny_hits=list(heuristic["deny_hits"]),
+                    category_music=bool(heuristic["category_music"]),
+                    forced=bool(force),
+                )
+
+                async with self._lock:
+                    if any(existing.video_id == item.video_id for existing in self.queue):
+                        skipped_duplicate += 1
+                        continue
+                    if len(self.queue) >= self.queue_max:
+                        skipped_limit += 1
+                        continue
+                    if not force:
+                        user_pending_now = sum(1 for existing in self.queue if existing.submitted_by_user_id == user_id)
+                        if user_pending_now >= self.max_per_user:
+                            skipped_limit += 1
+                            continue
+                    self.queue.append(item)
+                    added_items.append(item)
+                    vc = self.voice_client
+                    has_connected_voice = bool(vc is not None and vc.is_connected())
+                    should_kick_playback = should_kick_playback or bool(
+                        vc is not None and vc.is_connected() and (not vc.is_playing()) and (not vc.is_paused()) and self.current_item is None
+                    )
+                    if should_kick_playback:
+                        self._cancel_idle_disconnect_task_locked()
+
+            if not added_items:
+                if rejection_sample:
+                    return (False, f"Queue rejected: {rejection_sample}")
+                if skipped_duplicate > 0:
+                    return (False, "Queue rejected: all requested tracks were already in the queue.")
+                if skipped_limit > 0:
+                    return (False, "Queue rejected: queue/per-user limits prevented adding tracks.")
+                return (False, "Queue rejected: no playable tracks were accepted from request.")
+
+            async with self._lock:
+                self.last_queue_at_by_user[user_id] = now_monotonic
+                final_queue_len = len(self.queue)
+
+            for item in added_items:
+                print(
+                    f"[MUSIC] action=queue result=ok user={user_id} "
+                    f"video_id={item.video_id} score={item.score} forced={item.forced}"
+                )
+
             if should_kick_playback and not self.dry_run:
                 await self._play_next()
+
             suffix = ""
             if not has_connected_voice:
                 suffix = " Epoxy is not in voice yet. Operator: run `!music.start`."
+
+            if source_kind == "video":
+                item = added_items[0]
+                return (
+                    True,
+                    f"Queued: {item.title} (score={item.score}, by={item.uploader}). Position: {final_queue_len}.{suffix}",
+                )
+
+            total_requested = len(candidate_video_ids)
+            skipped_total = total_requested - len(added_items)
+            detail_bits: list[str] = []
+            if skipped_duplicate:
+                detail_bits.append(f"duplicates={skipped_duplicate}")
+            if skipped_metadata:
+                detail_bits.append(f"metadata={skipped_metadata}")
+            if skipped_limit:
+                detail_bits.append(f"limits={skipped_limit}")
+            detail_suffix = f" ({', '.join(detail_bits)})" if detail_bits else ""
+            label = playlist_title or "playlist"
             return (
                 True,
-                f"Queued: {item.title} (score={item.score}, by={item.uploader}). Position: {queue_position}.{suffix}",
+                (
+                    f"Queued playlist: {label}. "
+                    f"Added {len(added_items)}/{total_requested} tracks; skipped {skipped_total}{detail_suffix}.{suffix}"
+                ),
             )
         finally:
             async with self._lock:
                 self.pending_intake_count = max(0, int(self.pending_intake_count) - 1)
 
-    async def start(self, *, bot, guild: discord.Guild, actor_user_id: int) -> tuple[bool, str]:
+    async def start(
+        self,
+        *,
+        bot,
+        guild: discord.Guild,
+        actor_user_id: int,
+        channel_selection: str | None = None,
+    ) -> tuple[bool, str]:
         reason = self.disabled_reason()
         if reason:
             return (False, f"Music is disabled: {reason}.")
         if guild is None:
             return (False, "Start failed: this command only works in a server.")
+        ok_target, target_name, target_channel_id, target_err = self.resolve_voice_target(channel_selection)
+        if not ok_target or target_channel_id is None:
+            return (False, f"Start failed: {target_err or 'invalid voice target'}")
 
         self._loop = asyncio.get_running_loop()
 
         if self.dry_run:
             async with self._lock:
                 self.connected_guild_id = int(guild.id)
+                self.active_voice_channel_id = int(target_channel_id)
+                self.active_voice_target = str(target_name or "unknown")
                 if self.current_item is None and self.queue:
                     self.current_item = self.queue.popleft()
                 self._cancel_idle_disconnect_task_locked()
             print(f"[MUSIC] action=start result=dry_run user={actor_user_id} guild={int(guild.id)}")
             if self.current_item is not None:
-                return (True, f"[dry-run] Music started. Now playing: {self.current_item.title}")
-            return (True, "[dry-run] Music started. Queue is empty.")
+                return (
+                    True,
+                    f"[dry-run] Music started in {target_name}. Now playing: {self.current_item.title}",
+                )
+            return (True, f"[dry-run] Music started in {target_name}. Queue is empty.")
 
-        voice_channel = guild.get_channel(self.voice_channel_id)
+        voice_channel = guild.get_channel(target_channel_id)
         if voice_channel is None:
             try:
-                voice_channel = await bot.fetch_channel(self.voice_channel_id)
+                voice_channel = await bot.fetch_channel(target_channel_id)
             except Exception:
                 voice_channel = None
         if (
@@ -407,19 +719,21 @@ class MusicService:
             or not hasattr(voice_channel, "id")
             or not hasattr(voice_channel, "connect")
         ):
-            return (False, f"Start failed: configured voice channel {self.voice_channel_id} was not found.")
+            return (False, f"Start failed: configured voice channel {target_channel_id} was not found.")
 
         try:
             vc = guild.voice_client
             if vc is None:
                 vc = await voice_channel.connect()
-            elif int(getattr(vc.channel, "id", 0) or 0) != self.voice_channel_id:
+            elif int(getattr(vc.channel, "id", 0) or 0) != target_channel_id:
                 await vc.move_to(voice_channel)
         except Exception as e:
             return (False, f"Start failed: could not connect voice ({str(e)[:180]}).")
 
         async with self._lock:
             self.voice_client = vc
+            self.active_voice_channel_id = int(target_channel_id)
+            self.active_voice_target = str(target_name or "unknown")
             self.connected_guild_id = int(guild.id)
             self._cancel_idle_disconnect_task_locked()
 
@@ -441,12 +755,15 @@ class MusicService:
             pending_n = int(self.pending_intake_count)
             last_error = self.last_playback_error
         if current_title:
-            return (True, f"Music started. Now playing: {current_title} (queue={queued_n}).")
+            return (True, f"Music started in {target_name}. Now playing: {current_title} (queue={queued_n}).")
         if pending_n > 0:
-            return (True, f"Music started. Queue intake in progress ({pending_n}); run `!music.now` in a moment.")
+            return (
+                True,
+                f"Music started in {target_name}. Queue intake in progress ({pending_n}); run `!music.now` in a moment.",
+            )
         if last_error:
-            return (True, f"Music started, but playback failed: {last_error}")
-        return (True, "Music started. Queue is empty.")
+            return (True, f"Music started in {target_name}, but playback failed: {last_error}")
+        return (True, f"Music started in {target_name}. Queue is empty.")
 
     async def stop(self, *, actor_user_id: int) -> tuple[bool, str]:
         reason = self.disabled_reason()
@@ -460,6 +777,8 @@ class MusicService:
             self._cancel_idle_disconnect_task_locked()
             vc = self.voice_client
             self.voice_client = None
+            self.active_voice_channel_id = None
+            self.active_voice_target = None
             self.connected_guild_id = None
 
         if vc is not None:
@@ -573,13 +892,21 @@ class MusicService:
             is_paused = bool(vc is not None and vc.is_paused()) if vc is not None else False
             current_title = self.current_item.title if self.current_item is not None else "(none)"
             q_len = len(self.queue)
+            active_voice_channel_id = self.active_voice_channel_id
+            active_voice_target = self.active_voice_target
+        voice_targets = ", ".join(
+            f"{name}:{channel_id}" for name, channel_id in sorted(self.voice_channel_aliases.items())
+        ) or "(none)"
         return (
             "Music status:\n"
             f"- enabled: {'yes' if reason is None else 'no'}\n"
             f"- disabled_reason: {reason or '(none)'}\n"
             f"- dry_run: {'yes' if self.dry_run else 'no'}\n"
             f"- text_channel_id: {self.text_channel_id}\n"
-            f"- voice_channel_id: {self.voice_channel_id}\n"
+            f"- default_voice_channel_id: {self.voice_channel_id}\n"
+            f"- voice_targets: {voice_targets}\n"
+            f"- active_voice_target: {active_voice_target or '(none)'}\n"
+            f"- active_voice_channel_id: {active_voice_channel_id or 0}\n"
             f"- connected: {'yes' if is_connected else 'no'}\n"
             f"- playing: {'yes' if is_playing else 'no'}\n"
             f"- paused: {'yes' if is_paused else 'no'}\n"
@@ -587,7 +914,7 @@ class MusicService:
             f"- queue_len: {q_len}\n"
             f"- queue_intake_inflight: {self.pending_intake_count}\n"
             f"- last_playback_error: {self.last_playback_error or '(none)'}\n"
-            f"- queue_limits: total={self.queue_max}, per_user={self.max_per_user}, cooldown_s={self.queue_cooldown_seconds}"
+            f"- queue_limits: total={self.queue_max}, per_user={self.max_per_user}, cooldown_s={self.queue_cooldown_seconds}, playlist_max_items={self.playlist_max_items}"
         )
 
     async def _play_next(self) -> None:
@@ -701,6 +1028,8 @@ class MusicService:
             if vc.is_playing() or vc.is_paused():
                 return
             self.voice_client = None
+            self.active_voice_channel_id = None
+            self.active_voice_target = None
             self.connected_guild_id = None
         try:
             if vc.is_connected():

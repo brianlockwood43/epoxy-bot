@@ -188,11 +188,14 @@ Use this with:
 All `!music.*` commands are constrained to one configured text channel (`EPOXY_MUSIC_TEXT_CHANNEL_ID`), except:
 - `!music.status` can also be viewed by owners outside that channel.
 
-Playback is constrained to one configured voice channel (`EPOXY_MUSIC_VOICE_CHANNEL_ID`).
+Playback defaults to the calm voice channel (`EPOXY_MUSIC_VOICE_CHANNEL_ID`) and can be directed to named voice targets.
 
-1. `!music.start`
+1. `!music.start [calm|general]`
 - Access: operator-only (`EPOXY_MUSIC_OPERATOR_USER_IDS`, fallback owner IDs)
-- Purpose: connect Epoxy to configured voice channel and start queued playback if available
+- Purpose: connect Epoxy to selected voice target and start queued playback if available
+- Behavior:
+  - `!music.start` or `!music.start calm` -> use `EPOXY_MUSIC_VOICE_CHANNEL_ID`
+  - `!music.start general` -> use `EPOXY_MUSIC_GENERAL_VOICE_CHANNEL_ID`
 
 2. `!music.stop`
 - Access: operator-only
@@ -214,13 +217,13 @@ Playback is constrained to one configured voice channel (`EPOXY_MUSIC_VOICE_CHAN
 - Access: operator-only
 - Purpose: remove queued tracks without disconnecting
 
-7. `!music.forcequeue <youtube_url>`
+7. `!music.forcequeue <youtube_url_or_playlist_url>`
 - Access: operator-only
-- Purpose: queue a YouTube track while bypassing heuristic genre gate
+- Purpose: queue a YouTube track/playlist while bypassing heuristic genre gate
 
-8. `!music.queue <youtube_url>`
+8. `!music.queue <youtube_url_or_playlist_url>`
 - Access: users in configured music text channel
-- Purpose: queue a YouTube link if metadata heuristic passes calm/genre constraints
+- Purpose: queue a YouTube video or playlist. Playlist entries are capped by `EPOXY_MUSIC_PLAYLIST_MAX_ITEMS` and evaluated per track by metadata heuristic/limits
 
 9. `!music.queue_list [n]`
 - Access: users in configured music text channel
@@ -485,47 +488,55 @@ For DM draft episodes, `implicit_signals_json` includes structured artifact keys
 - Default: `0` (disabled until configured)
 - Voice destination Epoxy is allowed to connect to
 
-5. `EPOXY_MUSIC_OPERATOR_USER_IDS`
+5. `EPOXY_MUSIC_GENERAL_VOICE_CHANNEL_ID`
+- Default: `1411275538978308246`
+- Optional named voice target for `!music.start general`
+
+6. `EPOXY_MUSIC_OPERATOR_USER_IDS`
 - Optional
 - Operator IDs for control commands; falls back to owner IDs if unset
 
-6. `EPOXY_MUSIC_QUEUE_MAX`
+7. `EPOXY_MUSIC_QUEUE_MAX`
 - Default: `25`
 - Max total queue depth
 
-7. `EPOXY_MUSIC_MAX_PER_USER`
+8. `EPOXY_MUSIC_MAX_PER_USER`
 - Default: `3`
 - Max queued items per user
 
-8. `EPOXY_MUSIC_QUEUE_COOLDOWN_SECONDS`
+9. `EPOXY_MUSIC_QUEUE_COOLDOWN_SECONDS`
 - Default: `30`
 - Minimum delay between queue requests per user
 
-9. `EPOXY_MUSIC_IDLE_DISCONNECT_SECONDS`
+10. `EPOXY_MUSIC_IDLE_DISCONNECT_SECONDS`
 - Default: `600`
 - Auto-disconnect delay when queue is empty and playback is idle
 
-10. `EPOXY_MUSIC_YT_MIN_SCORE`
+11. `EPOXY_MUSIC_YT_MIN_SCORE`
 - Default: `2`
 - Minimum metadata heuristic score for non-operator queue requests
 
-11. `EPOXY_MUSIC_YT_ALLOW_KEYWORDS`
+12. `EPOXY_MUSIC_YT_ALLOW_KEYWORDS`
 - Default: `lofi,lo-fi,chillhop,smooth jazz,nu jazz,jazzhop,study beats`
 - Positive keyword list used by metadata scoring
 
-12. `EPOXY_MUSIC_YT_DENY_KEYWORDS`
+13. `EPOXY_MUSIC_YT_DENY_KEYWORDS`
 - Default: `phonk,hardstyle,dubstep,drill,trap,nightcore,bass boosted`
 - Negative keyword list used by metadata scoring
 
-13. `EPOXY_MUSIC_MIN_DURATION_SECONDS`
+14. `EPOXY_MUSIC_MIN_DURATION_SECONDS`
 - Default: `90`
 - Minimum accepted video duration for queue intake
 
-14. `EPOXY_MUSIC_MAX_DURATION_SECONDS`
+15. `EPOXY_MUSIC_MAX_DURATION_SECONDS`
 - Default: `7200`
 - Maximum accepted video duration for queue intake
 
-15. `EPOXY_MUSIC_DRY_RUN`
+16. `EPOXY_MUSIC_PLAYLIST_MAX_ITEMS`
+- Default: `10`
+- Max tracks expanded from a single playlist queue request
+
+17. `EPOXY_MUSIC_DRY_RUN`
 - Default: `0`
 - If `1`, commands and queueing work but voice playback operations are simulated
 

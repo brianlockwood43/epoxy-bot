@@ -14,6 +14,7 @@ from config.defaults import DEFAULT_ALLOWED_CHANNEL_IDS
 from config.defaults import DEFAULT_BACKFILL_LIMIT
 from config.defaults import DEFAULT_BACKFILL_PAUSE_EVERY
 from config.defaults import DEFAULT_BACKFILL_PAUSE_SECONDS
+from config.defaults import DEFAULT_MUSIC_GENERAL_VOICE_CHANNEL_ID
 from config.defaults import DEFAULT_MEMORY_REVIEW_MODE
 from config.defaults import DEFAULT_RECENT_CONTEXT_LIMIT
 from config.defaults import DEFAULT_RECENT_CONTEXT_LINE_CHARS
@@ -304,6 +305,10 @@ MUSIC_ENABLED = os.getenv("EPOXY_MUSIC_ENABLED", "0").strip() == "1"
 MUSIC_RISK_ACK = os.getenv("EPOXY_MUSIC_RISK_ACK", "").strip()
 MUSIC_TEXT_CHANNEL_ID = _env_int("EPOXY_MUSIC_TEXT_CHANNEL_ID", 0)
 MUSIC_VOICE_CHANNEL_ID = _env_int("EPOXY_MUSIC_VOICE_CHANNEL_ID", 0)
+MUSIC_GENERAL_VOICE_CHANNEL_ID = _env_int(
+    "EPOXY_MUSIC_GENERAL_VOICE_CHANNEL_ID",
+    DEFAULT_MUSIC_GENERAL_VOICE_CHANNEL_ID,
+)
 MUSIC_OPERATOR_USER_IDS = parse_id_set(os.getenv("EPOXY_MUSIC_OPERATOR_USER_IDS"))
 if not MUSIC_OPERATOR_USER_IDS:
     MUSIC_OPERATOR_USER_IDS = set(OWNER_USER_IDS)
@@ -322,14 +327,21 @@ MUSIC_YT_DENY_KEYWORDS = _env_keywords(
 )
 MUSIC_MIN_DURATION_SECONDS = _env_int("EPOXY_MUSIC_MIN_DURATION_SECONDS", 90)
 MUSIC_MAX_DURATION_SECONDS = _env_int("EPOXY_MUSIC_MAX_DURATION_SECONDS", 7200)
+MUSIC_PLAYLIST_MAX_ITEMS = _env_int("EPOXY_MUSIC_PLAYLIST_MAX_ITEMS", 10)
 MUSIC_DRY_RUN = os.getenv("EPOXY_MUSIC_DRY_RUN", "0").strip() == "1"
 if MUSIC_TEXT_CHANNEL_ID > 0:
     ALLOWED_CHANNEL_IDS.add(int(MUSIC_TEXT_CHANNEL_ID))
+if MUSIC_VOICE_CHANNEL_ID > 0:
+    ALLOWED_CHANNEL_IDS.add(int(MUSIC_VOICE_CHANNEL_ID))
+if MUSIC_GENERAL_VOICE_CHANNEL_ID > 0:
+    ALLOWED_CHANNEL_IDS.add(int(MUSIC_GENERAL_VOICE_CHANNEL_ID))
 
 print(
     f"[CFG] music_enabled={MUSIC_ENABLED} dry_run={MUSIC_DRY_RUN} "
     f"text_channel={MUSIC_TEXT_CHANNEL_ID} voice_channel={MUSIC_VOICE_CHANNEL_ID} "
+    f"general_voice_channel={MUSIC_GENERAL_VOICE_CHANNEL_ID} "
     f"operators={len(MUSIC_OPERATOR_USER_IDS)} queue_max={MUSIC_QUEUE_MAX} "
+    f"playlist_max_items={MUSIC_PLAYLIST_MAX_ITEMS} "
     f"per_user={MUSIC_MAX_PER_USER} cooldown_s={MUSIC_QUEUE_COOLDOWN_SECONDS} "
     f"allowed_channels={len(ALLOWED_CHANNEL_IDS)}"
 )
@@ -1276,6 +1288,7 @@ music_service = MusicService(
     risk_ack=MUSIC_RISK_ACK,
     text_channel_id=MUSIC_TEXT_CHANNEL_ID,
     voice_channel_id=MUSIC_VOICE_CHANNEL_ID,
+    voice_channel_aliases={"general": MUSIC_GENERAL_VOICE_CHANNEL_ID},
     operator_user_ids=MUSIC_OPERATOR_USER_IDS,
     queue_max=MUSIC_QUEUE_MAX,
     max_per_user=MUSIC_MAX_PER_USER,
@@ -1286,6 +1299,7 @@ music_service = MusicService(
     yt_deny_keywords=MUSIC_YT_DENY_KEYWORDS,
     min_duration_seconds=MUSIC_MIN_DURATION_SECONDS,
     max_duration_seconds=MUSIC_MAX_DURATION_SECONDS,
+    playlist_max_items=MUSIC_PLAYLIST_MAX_ITEMS,
     dry_run=MUSIC_DRY_RUN,
 )
 

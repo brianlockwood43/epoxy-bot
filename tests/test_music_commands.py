@@ -186,6 +186,70 @@ class MusicCommandsAuthTests(unittest.IsolatedAsyncioTestCase):
         await cmd.callback(ctx, youtube_url="https://youtu.be/dQw4w9WgXcQ")
         self.assertTrue(any("music is disabled" in s.lower() for s in ctx.sent))
 
+    async def test_music_start_passes_voice_target_to_service(self):
+        class StubMusicService:
+            text_channel_id = 123
+
+            def __init__(self):
+                self.last_channel_selection = None
+
+            def disabled_reason(self):
+                return None
+
+            def in_music_text_channel(self, channel_id: int):
+                return int(channel_id) == 123
+
+            def is_operator(self, user_id: int):
+                return True
+
+            async def start(self, *, bot, guild, actor_user_id: int, channel_selection: str | None = None):
+                self.last_channel_selection = channel_selection
+                return (True, f"started:{channel_selection}")
+
+        class FakeChannel:
+            id = 123
+
+            async def send(self, text):
+                return None
+
+        class FakeAuthor:
+            id = 1
+
+        class FakeGuild:
+            id = 7
+
+        class FakeCtx:
+            def __init__(self):
+                self.channel = FakeChannel()
+                self.author = FakeAuthor()
+                self.guild = FakeGuild()
+                self.sent: list[str] = []
+
+            async def send(self, text):
+                self.sent.append(text)
+
+        service = StubMusicService()
+        bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
+        register_music(
+            bot,
+            deps=CommandDeps(
+                send_chunked=lambda channel, text: None,
+                music_service=service,
+            ),
+            gates=CommandGates(
+                in_allowed_channel=lambda ctx: True,
+                allowed_channel_ids={123},
+                user_is_owner=lambda user: False,
+            ),
+        )
+
+        cmd = bot.get_command("music.start")
+        self.assertIsNotNone(cmd)
+        ctx = FakeCtx()
+        await cmd.callback(ctx, target="general")
+        self.assertEqual(service.last_channel_selection, "general")
+        self.assertTrue(any("started:general" in s for s in ctx.sent))
+
 
 if __name__ == "__main__":
     unittest.main()

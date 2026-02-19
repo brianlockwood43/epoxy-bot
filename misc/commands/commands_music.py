@@ -45,12 +45,17 @@ def register(
 
     @bot.command(name="music.start")
     @commands.guild_only()
-    async def music_start(ctx: commands.Context):
+    async def music_start(ctx: commands.Context, *, target: str = ""):
         if not await _ensure_music_access(ctx):
             return
         if not await _ensure_operator(ctx):
             return
-        ok, msg = await service.start(bot=bot, guild=ctx.guild, actor_user_id=int(ctx.author.id))
+        ok, msg = await service.start(
+            bot=bot,
+            guild=ctx.guild,
+            actor_user_id=int(ctx.author.id),
+            channel_selection=str(target or "").strip(),
+        )
         await ctx.send(msg if ok else f"Error: {msg}")
 
     @bot.command(name="music.stop")

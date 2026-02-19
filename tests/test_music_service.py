@@ -17,6 +17,7 @@ if MusicService is not None:
             super().__init__(**kwargs)
             self._metadata_map: dict[str, dict] = {}
             self._stream_map: dict[str, tuple[bool, str | None, str | None]] = {}
+            self._playlist_map: dict[str, tuple[list[str], str]] = {}
 
         async def fetch_video_metadata(self, canonical_url: str):
             payload = self._metadata_map.get(canonical_url)
@@ -26,6 +27,20 @@ if MusicService is not None:
 
         async def resolve_stream_url(self, canonical_url: str):
             return self._stream_map.get(canonical_url, (False, None, "missing stream fixture"))
+
+        async def fetch_playlist_video_ids(self, playlist_url: str, *, max_items: int):
+            payload = self._playlist_map.get(playlist_url)
+            if payload is None:
+                return (False, None, None, "missing playlist fixture")
+            raw_ids, title = payload
+            out: list[str] = []
+            for video_id in raw_ids:
+                if video_id in out:
+                    continue
+                out.append(video_id)
+                if len(out) >= max_items:
+                    break
+            return (True, out, title, None)
 else:  # pragma: no cover
     _StubMusicService = object
 
@@ -79,6 +94,9 @@ class _FakeVoiceClient:
         self.disconnect_calls += 1
         self.connected = False
 
+    async def move_to(self, channel):
+        self.channel = channel
+
 
 class _FakeVoiceChannel:
     def __init__(self, channel_id: int, guild):
@@ -93,10 +111,12 @@ class _FakeVoiceChannel:
 
 
 class _FakeGuild:
-    def __init__(self, guild_id: int, voice_channel_id: int):
+    def __init__(self, guild_id: int, voice_channel_id: int, extra_voice_channel_ids: list[int] | None = None):
         self.id = int(guild_id)
         self.voice_client = None
         self._channels = {int(voice_channel_id): _FakeVoiceChannel(voice_channel_id, self)}
+        for channel_id in (extra_voice_channel_ids or []):
+            self._channels[int(channel_id)] = _FakeVoiceChannel(int(channel_id), self)
 
     def get_channel(self, channel_id: int):
         return self._channels.get(int(channel_id))
@@ -126,6 +146,7 @@ def _service_factory(**overrides):
         yt_deny_keywords=["hardstyle", "phonk"],
         min_duration_seconds=90,
         max_duration_seconds=7200,
+        playlist_max_items=10,
         dry_run=False,
     )
     base.update(overrides)
@@ -151,6 +172,13 @@ class MusicServiceUnitTests(unittest.TestCase):
         ok, _, _, err = svc.normalize_youtube_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=abc")
         self.assertFalse(ok)
         self.assertIn("playlist", (err or "").lower())
+
+    def test_parse_intake_accepts_playlist_link(self):
+        svc = _service_factory()
+        ok, payload, err = svc.parse_youtube_intake("https://www.youtube.com/playlist?list=PL1234567890")
+        self.assertTrue(ok, err)
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload.get("kind"), "playlist")
 
     def test_heuristic_accepts_lofi_music_metadata(self):
         svc = _service_factory()
@@ -181,6 +209,21 @@ class MusicServiceUnitTests(unittest.TestCase):
         )
         self.assertFalse(out["passes"])
         self.assertGreater(len(out["deny_hits"]), 0)
+
+    def test_resolve_voice_target_default_and_general_alias(self):
+        svc = _service_factory(
+            voice_channel_id=555,
+            voice_channel_aliases={"general": 999},
+        )
+        ok_default, target_default, channel_default, err_default = svc.resolve_voice_target("")
+        self.assertTrue(ok_default, err_default)
+        self.assertEqual(target_default, "calm")
+        self.assertEqual(channel_default, 555)
+
+        ok_general, target_general, channel_general, err_general = svc.resolve_voice_target("general")
+        self.assertTrue(ok_general, err_general)
+        self.assertEqual(target_general, "general")
+        self.assertEqual(channel_general, 999)
 
 
 @unittest.skipIf(MusicService is None, "music service dependencies missing")
@@ -306,6 +349,47 @@ class MusicServiceAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok_stop)
         self.assertEqual(len(svc.queue), 0)
         self.assertGreaterEqual(guild.voice_client.disconnect_calls, 1)
+
+    async def test_start_general_selects_general_voice_channel(self):
+        svc = _service_factory(
+            queue_cooldown_seconds=0,
+            voice_channel_id=555,
+            voice_channel_aliases={"general": 999},
+        )
+        guild = _FakeGuild(guild_id=1, voice_channel_id=555, extra_voice_channel_ids=[999])
+        bot = _FakeBot(guild)
+
+        ok, _ = await svc.start(bot=bot, guild=guild, actor_user_id=1, channel_selection="general")
+        self.assertTrue(ok)
+        self.assertIsNotNone(guild.voice_client)
+        self.assertEqual(int(guild.voice_client.channel.id), 999)
+
+    async def test_queue_playlist_adds_multiple_tracks(self):
+        svc = _service_factory(queue_cooldown_seconds=0, max_per_user=5)
+        vid1 = "dQw4w9WgXcQ"
+        vid2 = "9bZkp7q19f0"
+        self._seed_metadata(svc, vid1, "Track One")
+        self._seed_metadata(svc, vid2, "Track Two")
+        playlist_url = "https://www.youtube.com/playlist?list=PL1234567890"
+        svc._playlist_map[playlist_url] = ([vid1, vid2], "Calm Playlist")
+
+        ok, msg = await svc.queue_youtube(raw_url=playlist_url, submitted_by_user_id=88, force=False)
+        self.assertTrue(ok, msg)
+        self.assertIn("queued playlist", msg.lower())
+        self.assertEqual(len(svc.queue), 2)
+
+    async def test_queue_playlist_respects_playlist_max_items_cap(self):
+        svc = _service_factory(queue_cooldown_seconds=0, max_per_user=10, playlist_max_items=1)
+        vid1 = "dQw4w9WgXcQ"
+        vid2 = "9bZkp7q19f0"
+        self._seed_metadata(svc, vid1, "Track One")
+        self._seed_metadata(svc, vid2, "Track Two")
+        playlist_url = "https://www.youtube.com/playlist?list=PL1234567890"
+        svc._playlist_map[playlist_url] = ([vid1, vid2], "Cap Playlist")
+
+        ok, msg = await svc.queue_youtube(raw_url=playlist_url, submitted_by_user_id=89, force=False)
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(svc.queue), 1)
 
 
 if __name__ == "__main__":

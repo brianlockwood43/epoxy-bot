@@ -10,6 +10,8 @@ Required:
 - `EPOXY_MUSIC_RISK_ACK=I_ACCEPT_YOUTUBE_RISK`
 - `EPOXY_MUSIC_TEXT_CHANNEL_ID=<calm_text_channel_id>`
 - `EPOXY_MUSIC_VOICE_CHANNEL_ID=<calm_voice_channel_id>`
+- `EPOXY_MUSIC_GENERAL_VOICE_CHANNEL_ID=1411275538978308246` (or your desired general voice channel)
+- `EPOXY_MUSIC_PLAYLIST_MAX_ITEMS=10` (recommended initial cap)
 
 Recommended initial rollout:
 
@@ -32,6 +34,7 @@ With dry-run enabled:
 1. Run `!music.status` and confirm feature is enabled.
 2. Test channel gate:
    - run `!music.queue <url>` inside calm channel (should process)
+   - run `!music.queue <playlist_url>` and confirm capped expansion behavior
    - run same outside calm channel (should reject)
 3. Test role gate:
    - non-operator should be blocked from `!music.start`
@@ -46,7 +49,7 @@ Switch:
 
 Then:
 
-1. Operator runs `!music.start`
+1. Operator runs `!music.start` (calm) or `!music.start general`
 2. Members queue links via `!music.queue <youtube_url>`
 3. Operator tests transport:
    - `!music.skip`
